@@ -1,52 +1,66 @@
-import 'dotenv/config';
 import { Client, GatewayIntentBits } from 'discord.js';
-import { joinVoiceChannel, createAudioPlayer, createAudioResource } from '@discordjs/voice';
-import ytdl from 'ytdl-core';
+import { playMusic } from '../src/commands/music';
+import * as dotenv from 'dotenv';
 
-// Carga el token desde las variables de entorno
+// Cargar variables de entorno desde el archivo .env
+dotenv.config();
+
+const client = new Client({
+    intents: [
+        GatewayIntentBits.Guilds,
+        GatewayIntentBits.GuildMessages,
+        GatewayIntentBits.MessageContent,
+        GatewayIntentBits.GuildVoiceStates,
+    ],
+});
+
 const TOKEN = process.env.DISCORD_BOT_TOKEN;
 
 if (!TOKEN) {
-  throw new Error('Por favor, define el token en el archivo .env');
+    throw new Error('El token del bot no se encuentra configurado en el archivo .env.');
 }
 
-const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates, GatewayIntentBits.GuildMessages] });
-
-client.on('ready', () => {
-  console.log(`Bot iniciado como ${client.user?.tag}`);
+client.once('ready', () => {
+    console.log(`✅ Bot conectado como ${client.user?.tag}`);
 });
 
 client.on('messageCreate', async (message) => {
-  if (message.author.bot || !message.guild) return;
+    try {
+        // Ignorar mensajes de otros bots
+        if (message.author.bot) return;
 
-  if (message.content.startsWith('!play')) {
-    const args = message.content.split(' ');
-    const url = args[1];
+        // Comando !play
+        if (message.content.startsWith('!play')) {
+            const args = message.content.split(' ').slice(1); // Extraer los argumentos después de !play
+            const query = args.join(' '); // Combinar los argumentos en una consulta
 
-    if (!url || !ytdl.validateURL(url)) {
-      return message.reply('Por favor, proporciona un enlace válido de YouTube.');
+            // Validar si el usuario está en un canal de voz
+            if (!message.member?.voice.channel) {
+                await message.reply('❌ ¡Debes estar en un canal de voz para usar este comando!');
+                return;
+            }
+
+            // Validar si se proporcionó una consulta
+            if (!query) {
+                await message.reply('❌ Por favor, especifica una URL o el nombre de la canción.');
+                return;
+            }
+
+            // Intentar reproducir la música
+            await playMusic(
+                message.member.voice.channel.id,
+                message.guild!.id,
+                message.guild!.voiceAdapterCreator,
+                query
+            );
+            await message.reply(`🎶 Reproduciendo: ${query}`);
+        }
+    } catch (error) {
+        console.error('Error en el comando:', error);
+        await message.reply('❌ Ocurrió un error al ejecutar el comando.');
     }
-
-    const voiceChannel = message.member?.voice.channel;
-    if (!voiceChannel) {
-      return message.reply('¡Debes estar en un canal de voz para usar este comando!');
-    }
-
-    const connection = joinVoiceChannel({
-      channelId: voiceChannel.id,
-      guildId: message.guild.id,
-      adapterCreator: message.guild.voiceAdapterCreator,
-    });
-
-    const stream = ytdl(url, { filter: 'audioonly' });
-    const resource = createAudioResource(stream);
-    const player = createAudioPlayer();
-
-    player.play(resource);
-    connection.subscribe(player);
-
-    message.reply('🎶 ¡Reproduciendo tu canción!');
-  }
 });
 
-client.login(TOKEN);
+client.login(TOKEN).catch((error) => {
+    console.error('Error al conectar el bot:', error.message);
+});
