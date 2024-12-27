@@ -1,7 +1,10 @@
-import { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus, VoiceConnectionStatus } from '@discordjs/voice';
+import { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus, VoiceConnectionStatus, AudioPlayer } from '@discordjs/voice';
 import { exec } from 'child_process';
 import fs from 'fs';
 import path from 'path';
+
+let currentPlayer: AudioPlayer | null = null;  // Guardar el reproductor actual
+let currentConnection: any = null;  // Guardar la conexión actual
 
 function isValidYouTubeUrl(url: string): boolean {
     const regex = /^(https?\:\/\/)?(www\.youtube\.com|youtu\.?be)\/.+$/;
@@ -25,7 +28,19 @@ export async function playMusic(voiceChannelId: string, guildId: string, adapter
     // Limpiar la URL eliminando parámetros adicionales
     const cleanedUrl = cleanYouTubeUrl(query);
 
-    // Conexión al canal de voz
+    // Si hay una reproducción previa, destruye el reproductor y la conexión anteriores
+    if (currentPlayer) {
+        currentPlayer.stop();
+        console.log("⏹️ Música detenida");
+    }
+
+    // Verificar si la conexión está activa, y si lo está, destruirla
+    if (currentConnection && currentConnection.state.status !== VoiceConnectionStatus.Destroyed) {
+        currentConnection.destroy();
+        console.log("❌ Conexión destruida");
+    }
+
+    // Conexión al canal de voz (nueva conexión siempre que se inicie una nueva canción)
     const connection = joinVoiceChannel({
         channelId: voiceChannelId,
         guildId: guildId,
@@ -44,12 +59,16 @@ export async function playMusic(voiceChannelId: string, guildId: string, adapter
         console.error('❌ Error en la conexión de voz:', error);
     });
 
+    // Guardar la conexión para futuras referencias
+    currentConnection = connection;
+
+    const outputPath = path.join(__dirname, 'src', 'commands', 'temp_audio.mp3'); // Ruta temporal para guardar el audio
+
     try {
         const videoUrl = cleanedUrl; // Usamos la URL limpia
-        const outputPath = path.join(__dirname, 'temp_audio.mp3'); // Ruta temporal para guardar el audio
 
-        // Usamos yt-dlp para obtener el audio
-        const execCommand = `yt-dlp -f bestaudio --extract-audio --audio-format mp3 --output "${outputPath}" ${videoUrl}`;
+        // Usamos yt-dlp para obtener el audio con el parámetro --no-cache-dir para evitar caché
+        const execCommand = `yt-dlp -f bestaudio --extract-audio --audio-format mp3 --no-cache-dir --output "${outputPath}" ${videoUrl}`;
 
         // Ejecutamos yt-dlp para descargar el audio
         exec(execCommand, (error, stdout, stderr) => {
@@ -97,6 +116,9 @@ export async function playMusic(voiceChannelId: string, guildId: string, adapter
             const player = createAudioPlayer();
             connection.subscribe(player);
 
+            // Guardar el reproductor actual para detenerlo si es necesario
+            currentPlayer = player;
+
             player.play(resource);
 
             player.on(AudioPlayerStatus.Playing, () => {
@@ -110,7 +132,10 @@ export async function playMusic(voiceChannelId: string, guildId: string, adapter
                 }
 
                 // Eliminar el archivo de audio temporal después de la reproducción
-                fs.unlinkSync(outputPath);
+                if (fs.existsSync(outputPath)) {
+                    fs.unlinkSync(outputPath);  // Eliminar el archivo después de la reproducción
+                    console.log('✅ Archivo de audio temporal eliminado');
+                }
             });
 
             player.on('error', (error) => {
@@ -129,6 +154,10 @@ export async function playMusic(voiceChannelId: string, guildId: string, adapter
         } else {
             console.error('❌ Error al obtener el stream o al crear el recurso:', error);
         }
-        connection.destroy(); // Asegurarse de destruir la conexión en caso de error
+        if (currentConnection) currentConnection.destroy();  // Asegurarse de destruir la conexión en caso de error
+        if (fs.existsSync(outputPath)) {
+            fs.unlinkSync(outputPath);  // Asegurarse de eliminar el archivo si ocurre un error
+            console.log('✅ Archivo de audio temporal eliminado (error)');
+        }
     }
 }
