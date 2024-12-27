@@ -30,7 +30,7 @@ client.on('messageCreate', async (message) => {
         if (message.author.bot) return;
 
         // Comando !play
-        if (message.content.startsWith('!play')) {
+        if (message.content.startsWith('!tocamela')) {
             const args = message.content.split(' ').slice(1); // Extraer los argumentos después de !play
             const query = args.join(' '); // Combinar los argumentos en una consulta
 

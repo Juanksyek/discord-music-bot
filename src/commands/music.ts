@@ -1,86 +1,134 @@
-import { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus } from '@discordjs/voice';
-import play from 'play-dl';
+import { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus, VoiceConnectionStatus } from '@discordjs/voice';
+import { exec } from 'child_process';
+import fs from 'fs';
+import path from 'path';
 
-// Función para crear un recurso de silencio
-function createSilentResource() {
-    const { Readable } = require('stream');
-    const silence = Buffer.from([0xF8, 0xFF, 0xFE]); // Paquete de silencio
-    const silenceStream = new Readable();
-    silenceStream.push(silence);
-    silenceStream.push(null);
-    return createAudioResource(silenceStream, { inlineVolume: true });
+function isValidYouTubeUrl(url: string): boolean {
+    const regex = /^(https?\:\/\/)?(www\.youtube\.com|youtu\.?be)\/.+$/;
+    return regex.test(url);
+}
+
+function cleanYouTubeUrl(url: string): string {
+    // Eliminar parámetros adicionales después de `?v=XXXXXXXXXXX`
+    const cleanedUrl = url.split('?')[0]; // Deja solo la parte base de la URL
+    return cleanedUrl;
 }
 
 export async function playMusic(voiceChannelId: string, guildId: string, adapterCreator: any, query: string) {
+    console.log("🎵 Obteniendo stream...");
+
+    // Validar la URL de YouTube
+    if (!isValidYouTubeUrl(query)) {
+        throw new Error('❌ La URL proporcionada no es válida.');
+    }
+
+    // Limpiar la URL eliminando parámetros adicionales
+    const cleanedUrl = cleanYouTubeUrl(query);
+
     // Conexión al canal de voz
     const connection = joinVoiceChannel({
         channelId: voiceChannelId,
         guildId: guildId,
         adapterCreator: adapterCreator,
     });
-    console.log('🔊 Conectado al canal de voz:', connection.state.status);
-    console.log('Adaptador de voz configurado:', adapterCreator);
 
-    // Agregar el listener de cambios de estado
+    connection.on(VoiceConnectionStatus.Ready, () => {
+        console.log('✅ Conexión lista para transmitir audio');
+    });
+
     connection.on('stateChange', (oldState, newState) => {
         console.log(`Estado de conexión cambiado: ${oldState.status} -> ${newState.status}`);
     });
 
+    connection.on('error', (error) => {
+        console.error('❌ Error en la conexión de voz:', error);
+    });
+
     try {
-        console.log('🎵 Obteniendo stream...');
-        const stream = await play.stream(query);
-        console.log('✅ Stream obtenido:', stream);
+        const videoUrl = cleanedUrl; // Usamos la URL limpia
+        const outputPath = path.join(__dirname, 'temp_audio.mp3'); // Ruta temporal para guardar el audio
 
-        // Listeners para depurar el stream
-        stream.stream.on('data', (chunk) => {
-            console.log('🔊 Recibiendo datos del stream:', chunk.length);
-        });
+        // Usamos yt-dlp para obtener el audio
+        const execCommand = `yt-dlp -f bestaudio --extract-audio --audio-format mp3 --output "${outputPath}" ${videoUrl}`;
 
-        stream.stream.on('end', () => {
-            console.log('🔚 El stream ha finalizado.');
-        });
-
-        stream.stream.on('error', (error) => {
-            console.error('❌ Error en el stream:', error);
-        });
-
-        const resource = createAudioResource(stream.stream, {
-            inputType: stream.type,
-            inlineVolume: true,
-        });
-        resource.volume?.setVolume(1.0);
-        console.log('📦 Recurso de audio creado:', resource);
-
-        const player = createAudioPlayer();
-        connection.subscribe(player);
-
-        // Asegurarse de que el tiempo de espera no sea negativo
-        const timeoutDuration = Math.max(0, 5000); // Ajusta el tiempo de espera según sea necesario
-
-        console.log('🔇 Reproduciendo silencio...');
-        player.play(createSilentResource());
-
-        setTimeout(() => {
-            console.log('▶️ Reproduciendo recurso principal...');
-            player.play(resource);
-        }, timeoutDuration);
-
-        player.on(AudioPlayerStatus.Playing, () => {
-            console.log('🎶 Reproduciendo audio...');
-        });
-
-        player.on(AudioPlayerStatus.Idle, () => {
-            console.log('⏸️ Reproducción terminada.');
-            if (connection.state.status !== 'destroyed') {
+        // Ejecutamos yt-dlp para descargar el audio
+        exec(execCommand, (error, stdout, stderr) => {
+            if (error) {
+                console.error(`Error ejecutando yt-dlp: ${error.message}`);
                 connection.destroy();
+                return;
             }
-        });
 
-        player.on('error', (error) => {
-            console.error('❌ Error en el reproductor:', error);
+            if (stderr) {
+                console.error(`stderr: ${stderr}`);
+                connection.destroy();
+                return;
+            }
+
+            console.log(`stdout: ${stdout}`);
+            console.log("✅ Audio descargado con éxito");
+
+            // Creamos el stream desde el archivo mp3 descargado
+            const audioStream = fs.createReadStream(outputPath);
+
+            if (!audioStream || typeof audioStream.pipe !== 'function') {
+                throw new Error('❌ El stream obtenido no es válido o no se pudo crear.');
+            }
+
+            console.log('✅ Stream obtenido desde archivo MP3');
+
+            // Crear el AudioResource con el stream obtenido
+            const resource = createAudioResource(audioStream, {
+                inlineVolume: true,  // Activar el control de volumen
+                inputType: undefined,  // Dejar el tipo de entrada como indefinido
+                metadata: { title: videoUrl },  // Metadata para identificar el recurso
+            });
+
+            // Asegurar que el recurso de audio sea válido
+            if (!resource) {
+                throw new Error('❌ No se pudo crear el recurso de audio.');
+            }
+
+            // Asegurar que el volumen esté al máximo
+            resource.volume?.setVolume(1.0);
+            console.log('📦 Recurso de audio creado:', resource);
+
+            // Crear el reproductor de audio y suscribirlo a la conexión
+            const player = createAudioPlayer();
+            connection.subscribe(player);
+
+            player.play(resource);
+
+            player.on(AudioPlayerStatus.Playing, () => {
+                console.log('🎶 Reproduciendo audio...');
+            });
+
+            player.on(AudioPlayerStatus.Idle, () => {
+                console.log('⏸️ Reproducción terminada.');
+                if (connection.state.status !== VoiceConnectionStatus.Destroyed) {
+                    connection.destroy();
+                }
+
+                // Eliminar el archivo de audio temporal después de la reproducción
+                fs.unlinkSync(outputPath);
+            });
+
+            player.on('error', (error) => {
+                console.error('❌ Error en el reproductor:', error.message);
+                if (error.message.includes('Status code: 410')) {
+                    console.error('❌ El recurso solicitado ya no está disponible.');
+                } else {
+                    console.error(`❌ Error no esperado: ${error.message}`);
+                }
+            });
         });
 
     } catch (error) {
-        console.error('❌ Error al obtener el stream:', error);
+        if (error instanceof Error) {
+            console.error('❌ Error al obtener el stream o al crear el recurso:', error.message);
+        } else {
+            console.error('❌ Error al obtener el stream o al crear el recurso:', error);
+        }
+        connection.destroy(); // Asegurarse de destruir la conexión en caso de error
     }
 }
