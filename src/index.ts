@@ -53,7 +53,7 @@ client.on('messageCreate', async (message) => {
             // Crear el botón de detención
             const stopButton = new ButtonBuilder()
                 .setCustomId('stop_music')
-                .setLabel('Detener Música')
+                .setLabel('Paramela')
                 .setStyle(ButtonStyle.Danger);
 
             const row = new ActionRowBuilder<ButtonBuilder>().addComponents(stopButton);
