@@ -1,4 +1,4 @@
-import { Client, GatewayIntentBits, ActionRowBuilder, ButtonBuilder, ButtonStyle } from 'discord.js';  // Importar los componentes de los botones
+import { Client, GatewayIntentBits, ActionRowBuilder, ButtonBuilder, ButtonStyle, CommandInteractionOptionResolver } from 'discord.js';  // Importar los componentes de los botones
 import * as path from 'path';
 import * as fs from 'fs';
 import { playMusic } from '../src/commands/music';
@@ -132,6 +132,49 @@ client.on('interactionCreate', async (interaction) => {
             }
         } else {
             await interaction.reply({ content: '❌ No hay conexión activa', ephemeral: true });
+        }
+    }
+});
+
+client.on('interactionCreate', async (interaction) => {
+    if (!interaction.isCommand()) return;
+
+    if (interaction.commandName === 'create-dev-channel') {
+        // Verificar permisos del usuario
+        if (!interaction.memberPermissions?.has('ManageChannels')) {
+            await interaction.reply({ content: '❌ No tienes permisos para crear canales.', ephemeral: true });
+            return;
+        }
+
+        const channelName = (interaction.options as CommandInteractionOptionResolver).getString('nombre') || 'noticias-desarrolladores';
+
+        try {
+            // Crear el canal de texto
+            const devChannel = await interaction.guild?.channels.create({
+                name: channelName,
+                type: 0, // Canal de texto
+                topic: 'Actualizaciones de la API de Discord y noticias para desarrolladores.',
+                permissionOverwrites: [
+                    {
+                        id: interaction.guild.roles.everyone.id, // Todos los usuarios
+                        allow: ['ViewChannel'], // Permitir ver el canal
+                        deny: ['SendMessages'], // Denegar enviar mensajes
+                    },
+                    {
+                        id: interaction.user.id, // Usuario que ejecutó el comando
+                        allow: ['SendMessages'], // Permitir enviar mensajes
+                    },
+                ],
+            });
+
+            if (devChannel) {
+                await interaction.reply(`✅ Canal creado con éxito: <#${devChannel.id}>`);
+            } else {
+                throw new Error('No se pudo crear el canal.');
+            }
+        } catch (error) {
+            console.error('Error al crear el canal:', error);
+            await interaction.reply({ content: '❌ Hubo un error al intentar crear el canal.', ephemeral: true });
         }
     }
 });
