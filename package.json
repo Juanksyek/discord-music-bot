@@ -23,6 +23,7 @@
     "opusscript": "^0.0.8",
     "play-dl": "^1.9.7",
     "spotify-web-api-node": "^5.0.2",
+    "sqlite3": "^5.1.7",
     "typescript": "^5.7.2",
     "url": "^0.11.4",
     "yt-search": "^2.12.1",
