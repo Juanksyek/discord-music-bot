@@ -1,4 +1,4 @@
-import { Client, GatewayIntentBits, ActionRowBuilder, ButtonBuilder, ButtonStyle, CommandInteractionOptionResolver } from 'discord.js';  // Importar los componentes de los botones
+import { Client, GatewayIntentBits, ActionRowBuilder, ButtonBuilder, ButtonStyle, CommandInteractionOptionResolver, GuildMember } from 'discord.js';  // Importar los componentes de los botones
 import * as path from 'path';
 import * as fs from 'fs';
 import { playMusic } from '../src/commands/music';
@@ -8,6 +8,8 @@ import { AudioResource, createAudioPlayer, createAudioResource as djsCreateAudio
 
 // Cargar variables de entorno desde el archivo .env
 dotenv.config();
+
+const songQueue: string[] = [];
 
 const client = new Client({
     intents: [
@@ -80,61 +82,65 @@ client.on('messageCreate', async (message) => {
 });
 
 client.on('interactionCreate', async (interaction) => {
-    if (!interaction.isButton()) return;
+    if (!interaction.isCommand()) return;
 
-    if (interaction.customId === 'stop_music') {
-        if (!interaction.guildId) {
-            await interaction.reply({ content: '❌ No se pudo obtener la ID de la guild.', ephemeral: true });
+    if (interaction.commandName === 'tocamela') {
+        // Extraer la URL proporcionada por el usuario
+        const url = (interaction.options as CommandInteractionOptionResolver).getString('url');
+
+        const member = interaction.member as GuildMember;
+        if (!member.voice.channel) {
+            await interaction.reply({ content: '❌ ¡Debes estar en un canal de voz para usar este comando!', ephemeral: true });
             return;
         }
 
-        const connection = getVoiceConnection(interaction.guildId);
+        // Validar la URL de YouTube
+        if (!isValidYouTubeUrl(url)) {
+            await interaction.reply({ content: '❌ La URL proporcionada no es válida.', ephemeral: true });
+            return;
+        }
 
-        if (connection) {
-            console.log("⏹️ Deteniendo la música");
-
-            // Obtener el reproductor de audio actual
-            const player = (connection.state as any).subscription?.player;
-
-            if (player) {
-                // Obtener el tiempo total de la canción en segundos
-                const totalDuration = player.state.resource.playbackDuration;
-
-                // Si la canción está en reproducción, deténla y reiníciala 1 segundo antes de finalizar
-                if (totalDuration > 1000) { // Asegurarse de que no estemos en los últimos 1 segundo
-                    player.stop();
-                    console.log('🎶 Música detenida, reiniciando desde 1 segundo antes del final.');
-
-                    // Volver a crear el AudioResource desde el archivo y reproducirlo
-                    const outputPath = path.join(__dirname, 'src', 'commands', 'temp_audio.mp3');
-                    const audioStream = fs.createReadStream(outputPath);
-
-                    if (!audioStream || typeof audioStream.pipe !== 'function') {
-                        throw new Error('❌ El stream obtenido no es válido o no se pudo crear.');
-                    }
-
-                    // Recreate resource with adjusted start point
-                    const resource = createAudioResource(audioStream, {
-                        inlineVolume: true,
-                        metadata: { title: player.state.resource.metadata.title },
-                    });
-
-                    // Reproducir nuevamente desde el nuevo punto
-                    player.play(resource);
-                    await interaction.reply({ content: '🎶 Reproducción avanzada a 1 segundo antes del final.', ephemeral: true });
-                } else {
-                    // Si está cerca de terminar, detener la música
-                    player.stop();
-                    await interaction.reply({ content: '🎶 Música detenida', ephemeral: true });
-                }
+        // Reproducir la música
+        try {
+            // Añadir la canción a la cola
+            if (url) {
+                songQueue.push(url);
             } else {
-                await interaction.reply({ content: '❌ No hay música reproduciéndose', ephemeral: true });
+                await interaction.reply({ content: '❌ La URL proporcionada no es válida.', ephemeral: true });
+                return;
             }
-        } else {
-            await interaction.reply({ content: '❌ No hay conexión activa', ephemeral: true });
+            console.log(`🎶 Canción añadida a la cola: ${url}`);
+
+            // Si no hay música reproduciéndose, comienza la reproducción
+            if (songQueue.length === 1) {
+                await playMusic(
+                    (interaction.member as GuildMember)?.voice?.channel?.id ?? '',
+                    interaction.guild!.id,
+                    interaction.guild!.voiceAdapterCreator,
+                    songQueue[0]
+                );
+            }
+
+            // Crear el botón de detención
+            const stopButton = new ButtonBuilder()
+                .setCustomId('stop_music')
+                .setLabel('Detener Música')
+                .setStyle(ButtonStyle.Danger);
+
+            const row = new ActionRowBuilder<ButtonBuilder>().addComponents(stopButton);
+
+            // Responder al usuario que la canción se ha añadido
+            await interaction.reply({
+                content: `🎶 Canción añadida a la cola: ${url}`,
+                components: [row],
+            });
+        } catch (error) {
+            console.error('Error al intentar reproducir la música:', error);
+            await interaction.reply({ content: '❌ Ocurrió un error al intentar reproducir la música.', ephemeral: true });
         }
     }
 });
+
 
 client.on('interactionCreate', async (interaction) => {
     if (!interaction.isCommand()) return;
@@ -190,3 +196,9 @@ function createAudioResource(audioStream: fs.ReadStream, options: { inlineVolume
 client.login(TOKEN).catch((error) => {
     console.error('Error al conectar el bot:', error.message);
 });
+
+function isValidYouTubeUrl(url: string | null): boolean {
+    if (!url) return false;
+    const regex = /^(https?:\/\/)?(www\.)?(youtube\.com|youtu\.?be)\/.+$/;
+    return regex.test(url);
+}
