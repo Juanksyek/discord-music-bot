@@ -23,7 +23,18 @@ const commands = [
             },
         ],
     },
-
+    {
+        name: 'tocamela',  // Comando /tocamela
+        description: 'Reproduce música en el canal de voz',
+        options: [
+            {
+                name: 'url',
+                type: 3,  // STRING
+                description: 'La URL de la canción o video de YouTube',
+                required: true,
+            },
+        ],
+    },
 ];
 
 const rest = new REST({ version: '10' }).setToken(TOKEN);
