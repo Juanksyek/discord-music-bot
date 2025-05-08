@@ -1,15 +1,11 @@
-import { Client, GatewayIntentBits, ActionRowBuilder, ButtonBuilder, ButtonStyle, CommandInteractionOptionResolver, GuildMember } from 'discord.js';  // Importar los componentes de los botones
+import { Client, GatewayIntentBits, ActionRowBuilder, ButtonBuilder, ButtonStyle, CommandInteractionOptionResolver, GuildMember } from 'discord.js';
 import * as path from 'path';
 import * as fs from 'fs';
-import { playMusic } from '../src/commands/music';
+import { playMusic, currentConnection, currentPlayer, setCurrentConnection, setCurrentPlayer } from '../src/commands/music';
 import * as dotenv from 'dotenv';
-import { getVoiceConnection } from '@discordjs/voice';
-import { AudioResource, createAudioPlayer, createAudioResource as djsCreateAudioResource } from '@discordjs/voice';
+import { joinVoiceChannel, createAudioPlayer, VoiceConnectionStatus } from '@discordjs/voice';
 
-// Cargar variables de entorno desde el archivo .env
 dotenv.config();
-
-const songQueue: string[] = [];
 
 const client = new Client({
     intents: [
@@ -30,29 +26,25 @@ client.once('ready', () => {
     console.log(`✅ Bot conectado como ${client.user?.tag}`);
 });
 
+// 🎵 Comando !tocamela vía mensaje
 client.on('messageCreate', async (message) => {
     try {
-        // Ignorar mensajes de otros bots
         if (message.author.bot) return;
 
-        // Comando !tocamela
         if (message.content.startsWith('!tocamela')) {
-            const args = message.content.split(' ').slice(1); // Extraer los argumentos después de !play
-            const query = args.join(' '); // Combinar los argumentos en una consulta
+            const args = message.content.split(' ').slice(1);
+            const query = args.join(' ');
 
-            // Validar si el usuario está en un canal de voz
             if (!message.member?.voice.channel) {
                 await message.reply('❌ ¡Debes estar en un canal de voz para usar este comando!');
                 return;
             }
 
-            // Validar si se proporcionó una consulta
             if (!query) {
                 await message.reply('❌ Por favor, especifica una URL o el nombre de la canción.');
                 return;
             }
 
-            // Crear el botón de detención
             const stopButton = new ButtonBuilder()
                 .setCustomId('stop_music')
                 .setLabel('Paramela')
@@ -60,20 +52,17 @@ client.on('messageCreate', async (message) => {
 
             const row = new ActionRowBuilder<ButtonBuilder>().addComponents(stopButton);
 
-            // Enviar el mensaje con el botón de detener
-            const replyMessage = await message.reply({
-                content: `🎶 Reproduciendo: ${query}`,
+            await message.reply({
+                content: `🎶 Reproduciendo ahora: ${query}`,
                 components: [row],
             });
 
-            // Intentar reproducir la música
             await playMusic(
                 message.member.voice.channel.id,
                 message.guild!.id,
                 message.guild!.voiceAdapterCreator,
                 query
             );
-            //await message.reply(`🎶 Reproduciendo: ${query}`);
         }
     } catch (error) {
         console.error('Error en el comando:', error);
@@ -81,47 +70,31 @@ client.on('messageCreate', async (message) => {
     }
 });
 
+// 🎵 Comando slash /tocamela
 client.on('interactionCreate', async (interaction) => {
     if (!interaction.isCommand()) return;
 
     if (interaction.commandName === 'tocamela') {
-        // Extraer la URL proporcionada por el usuario
         const url = (interaction.options as CommandInteractionOptionResolver).getString('url');
-
         const member = interaction.member as GuildMember;
+
         if (!member.voice.channel) {
-            await interaction.reply({ content: '❌ ¡Debes estar en un canal de voz para usar este comando!', ephemeral: true });
+            await interaction.reply({
+                content: '❌ ¡Debes estar en un canal de voz para usar este comando!',
+                ephemeral: true
+            });
             return;
         }
 
-        // Validar la URL de YouTube
         if (!isValidYouTubeUrl(url)) {
-            await interaction.reply({ content: '❌ La URL proporcionada no es válida.', ephemeral: true });
+            await interaction.reply({
+                content: '❌ La URL proporcionada no es válida.',
+                ephemeral: true
+            });
             return;
         }
 
-        // Reproducir la música
         try {
-            // Añadir la canción a la cola
-            if (url) {
-                songQueue.push(url);
-            } else {
-                await interaction.reply({ content: '❌ La URL proporcionada no es válida.', ephemeral: true });
-                return;
-            }
-            console.log(`🎶 Canción añadida a la cola: ${url}`);
-
-            // Si no hay música reproduciéndose, comienza la reproducción
-            if (songQueue.length === 1) {
-                await playMusic(
-                    (interaction.member as GuildMember)?.voice?.channel?.id ?? '',
-                    interaction.guild!.id,
-                    interaction.guild!.voiceAdapterCreator,
-                    songQueue[0]
-                );
-            }
-
-            // Crear el botón de detención
             const stopButton = new ButtonBuilder()
                 .setCustomId('stop_music')
                 .setLabel('Detener Música')
@@ -129,76 +102,108 @@ client.on('interactionCreate', async (interaction) => {
 
             const row = new ActionRowBuilder<ButtonBuilder>().addComponents(stopButton);
 
-            // Responder al usuario que la canción se ha añadido
             await interaction.reply({
-                content: `🎶 Canción añadida a la cola: ${url}`,
+                content: `🎶 Reproduciendo ahora: ${url}`,
                 components: [row],
             });
+
+            await playMusic(
+                member.voice.channel.id,
+                interaction.guild!.id,
+                interaction.guild!.voiceAdapterCreator,
+                url!
+            );
         } catch (error) {
             console.error('Error al intentar reproducir la música:', error);
-            await interaction.reply({ content: '❌ Ocurrió un error al intentar reproducir la música.', ephemeral: true });
+            await interaction.reply({
+                content: '❌ Ocurrió un error al intentar reproducir la música.',
+                ephemeral: true
+            });
         }
     }
 });
 
-
+// 🛑 Botón: detener música y reiniciar conexión
 client.on('interactionCreate', async (interaction) => {
-    if (!interaction.isCommand()) return;
+    if (!interaction.isButton()) return;
 
-    if (interaction.commandName === 'create-dev-channel') {
-        // Verificar permisos del usuario
-        if (!interaction.memberPermissions?.has('ManageChannels')) {
-            await interaction.reply({ content: '❌ No tienes permisos para crear canales.', ephemeral: true });
+    if (interaction.customId === 'stop_music') {
+        if (!interaction.guild || !interaction.member || !('voice' in interaction.member)) {
+            await interaction.reply({
+                content: '❌ No se pudo obtener información del canal de voz.',
+                ephemeral: true
+            });
             return;
         }
 
-        const channelName = (interaction.options as CommandInteractionOptionResolver).getString('nombre') || 'noticias-desarrolladores';
+        const member = interaction.member as GuildMember;
+        const voiceChannel = member.voice.channel;
 
-        try {
-            // Crear el canal de texto
-            const devChannel = await interaction.guild?.channels.create({
-                name: channelName,
-                type: 0, // Canal de texto
-                topic: 'Actualizaciones de la API de Discord y noticias para desarrolladores.',
-                permissionOverwrites: [
-                    {
-                        id: interaction.guild.roles.everyone.id, // Todos los usuarios
-                        allow: ['ViewChannel'], // Permitir ver el canal
-                        deny: ['SendMessages'], // Denegar enviar mensajes
-                    },
-                    {
-                        id: interaction.user.id, // Usuario que ejecutó el comando
-                        allow: ['SendMessages'], // Permitir enviar mensajes
-                    },
-                ],
+        if (!voiceChannel) {
+            await interaction.reply({
+                content: '❌ Debes estar en un canal de voz para reiniciar la música.',
+                ephemeral: true
             });
-
-            if (devChannel) {
-                await interaction.reply(`✅ Canal creado con éxito: <#${devChannel.id}>`);
-            } else {
-                throw new Error('No se pudo crear el canal.');
-            }
-        } catch (error) {
-            console.error('Error al crear el canal:', error);
-            await interaction.reply({ content: '❌ Hubo un error al intentar crear el canal.', ephemeral: true });
+            return;
         }
+
+        cleanTempFolder();
+
+        currentPlayer?.stop();
+        currentConnection?.destroy();
+
+        await interaction.reply({
+            content: '♻️ Reiniciando reproducción y reconectando...',
+            ephemeral: true
+        });
+
+        const connection = joinVoiceChannel({
+            channelId: voiceChannel.id,
+            guildId: voiceChannel.guild.id,
+            adapterCreator: voiceChannel.guild.voiceAdapterCreator,
+        });
+
+        connection.on(VoiceConnectionStatus.Ready, () => {
+            console.log('✅ Conexión lista para transmitir audio');
+        });
+
+        connection.on('stateChange', (oldState, newState) => {
+            console.log(`Estado de conexión cambiado: ${oldState.status} -> ${newState.status}`);
+        });
+
+        setCurrentConnection(connection);
+
+        const player = createAudioPlayer();
+        connection.subscribe(player);
+        setCurrentPlayer(player);
+
+        console.log('🎵 Conexión y reproductor reiniciados y listos.');
     }
 });
 
-function createAudioResource(audioStream: fs.ReadStream, options: { inlineVolume: boolean; metadata: { title: any; }; }): AudioResource {
-    const resource = djsCreateAudioResource(audioStream, {
-        inlineVolume: options.inlineVolume,
-        metadata: options.metadata,
-    });
-    return resource;
+// 🔧 Función de limpieza de carpeta temporal
+function cleanTempFolder() {
+    const tempPath = path.join(__dirname, '../src/commands');
+    const files = fs.readdirSync(tempPath);
+    for (const file of files) {
+        if (file.endsWith('.mp3')) {
+            try {
+                fs.unlinkSync(path.join(tempPath, file));
+            } catch (err) {
+                console.warn(`⚠️ No se pudo eliminar ${file}:`, err);
+            }
+        }
+    }
+    console.log('🧹 Carpeta temporal limpiada');
 }
 
-client.login(TOKEN).catch((error) => {
-    console.error('Error al conectar el bot:', error.message);
-});
-
+// 🎵 Validador URL YouTube
 function isValidYouTubeUrl(url: string | null): boolean {
     if (!url) return false;
     const regex = /^(https?:\/\/)?(www\.)?(youtube\.com|youtu\.?be)\/.+$/;
     return regex.test(url);
 }
+
+client.login(TOKEN).catch((error) => {
+    console.error('Error al conectar el bot:', error.message);
+});
