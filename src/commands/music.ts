@@ -1,22 +1,33 @@
-import { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus, VoiceConnectionStatus, AudioPlayer } from '@discordjs/voice';
+import { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus, VoiceConnectionStatus, AudioPlayer, VoiceConnection } from '@discordjs/voice';
 import { exec } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 
-let currentPlayer: AudioPlayer | null = null;  // Guardar el reproductor actual
-let currentConnection: any = null;  // Guardar la conexión actual
+export let currentPlayer: AudioPlayer | null = null;
+export let currentConnection: VoiceConnection | null = null;
+let disconnectTimeout: NodeJS.Timeout | null = null;
 
+// Validar si la URL es de YouTube
 function isValidYouTubeUrl(url: string): boolean {
     const regex = /^(https?\:\/\/)?(www\.youtube\.com|youtu\.?be)\/.+$/;
     return regex.test(url);
 }
 
+// Limpiar parámetros extra en la URL de YouTube
 function cleanYouTubeUrl(url: string): string {
-    // Eliminar parámetros adicionales después de `?v=XXXXXXXXXXX`
-    const cleanedUrl = url.split('?')[0]; // Deja solo la parte base de la URL
-    return cleanedUrl;
+    return url.split('?')[0];
 }
 
+// Setters para manejar el estado global desde otros archivos
+export function setCurrentConnection(connection: VoiceConnection | null) {
+    currentConnection = connection;
+}
+
+export function setCurrentPlayer(player: AudioPlayer | null) {
+    currentPlayer = player;
+}
+
+// Función principal para reproducir música en un canal de voz
 export async function playMusic(voiceChannelId: string, guildId: string, adapterCreator: any, query: string) {
     console.log("🎵 Obteniendo stream...");
 
@@ -28,13 +39,13 @@ export async function playMusic(voiceChannelId: string, guildId: string, adapter
     // Limpiar la URL eliminando parámetros adicionales
     const cleanedUrl = cleanYouTubeUrl(query);
 
-    // Si hay una reproducción previa, destruye el reproductor y la conexión anteriores
+    // Si hay una reproducción previa, detiene el reproductor actual
     if (currentPlayer) {
         currentPlayer.stop();
         console.log("⏹️ Música detenida");
     }
 
-    // Verificar si la conexión está activa, y si lo está, destruirla
+    // Si hay una conexión previa activa, destruirla
     if (currentConnection && currentConnection.state.status !== VoiceConnectionStatus.Destroyed) {
         currentConnection.destroy();
         console.log("❌ Conexión destruida");
@@ -47,6 +58,7 @@ export async function playMusic(voiceChannelId: string, guildId: string, adapter
         adapterCreator: adapterCreator,
     });
 
+    // Escuchar eventos de la conexión
     connection.on(VoiceConnectionStatus.Ready, () => {
         console.log('✅ Conexión lista para transmitir audio');
     });
@@ -62,50 +74,73 @@ export async function playMusic(voiceChannelId: string, guildId: string, adapter
     // Guardar la conexión para futuras referencias
     currentConnection = connection;
 
-    const outputPath = path.join(__dirname, 'src', 'commands', 'temp_audio.mp3'); // Ruta temporal para guardar el audio
+    const outputPath = path.join(__dirname, 'temp_audio.mp3');
 
     try {
-        const videoUrl = cleanedUrl; // Usamos la URL limpia
+        // 🔁 Eliminar archivo si ya existe antes de descargar
+        if (fs.existsSync(outputPath)) {
+            try {
+                fs.unlinkSync(outputPath);
+                console.log('🧹 Archivo viejo eliminado antes de nueva descarga');
+            } catch (err) {
+                console.warn('⚠️ No se pudo eliminar archivo previo:', err);
+            }
+        }
 
-        // Usamos yt-dlp para obtener el audio con el parámetro --no-cache-dir para evitar caché
-        const execCommand = `yt-dlp -f bestaudio --extract-audio --audio-format mp3 --no-cache-dir --output "${outputPath}" ${videoUrl}`;
+        const videoUrl = cleanedUrl;
 
-        // Ejecutamos yt-dlp para descargar el audio
+        // Comando yt-dlp mejorado con flags adicionales
+        const execCommand = `yt-dlp -f bestaudio --extract-audio --audio-format mp3 --no-cache-dir --no-check-certificate --ignore-errors --output "${outputPath}" "${videoUrl}"`;
+
+        // Mostrar el comando en consola para depuración
+        console.log('🛠️ Ejecutando yt-dlp con comando:', execCommand);
+
+        // Ejecutar el comando para descargar el audio
         exec(execCommand, (error, stdout, stderr) => {
             if (error) {
-                console.error(`Error ejecutando yt-dlp: ${error.message}`);
+                console.error(`❌ Error ejecutando yt-dlp: ${error.message}`);
                 connection.destroy();
                 return;
             }
 
             if (stderr) {
-                console.error(`stderr: ${stderr}`);
+                console.warn(`⚠️ yt-dlp stderr: ${stderr}`);
+            }
+
+            console.log(`stdout: ${stdout}`);
+            console.log("⏳ Verificando existencia de archivo descargado...");
+
+            // ✅ Validar que el archivo MP3 se haya creado correctamente
+            if (!fs.existsSync(outputPath)) {
+                console.error('❌ El archivo de audio no se generó. Fallo silencioso de descarga.');
                 connection.destroy();
                 return;
             }
 
-            console.log(`stdout: ${stdout}`);
             console.log("✅ Audio descargado con éxito");
 
             // Creamos el stream desde el archivo mp3 descargado
             const audioStream = fs.createReadStream(outputPath);
 
             if (!audioStream || typeof audioStream.pipe !== 'function') {
-                throw new Error('❌ El stream obtenido no es válido o no se pudo crear.');
+                console.error('❌ El stream obtenido no es válido.');
+                connection.destroy();
+                return;
             }
 
             console.log('✅ Stream obtenido desde archivo MP3');
 
             // Crear el AudioResource con el stream obtenido
             const resource = createAudioResource(audioStream, {
-                inlineVolume: true,  // Activar el control de volumen
-                inputType: undefined,  // Dejar el tipo de entrada como indefinido
-                metadata: { title: videoUrl },  // Metadata para identificar el recurso
+                inlineVolume: true,
+                metadata: { title: videoUrl },
             });
 
             // Asegurar que el recurso de audio sea válido
             if (!resource) {
-                throw new Error('❌ No se pudo crear el recurso de audio.');
+                console.error('❌ No se pudo crear el recurso de audio.');
+                connection.destroy();
+                return;
             }
 
             // Asegurar que el volumen esté al máximo
@@ -119,23 +154,43 @@ export async function playMusic(voiceChannelId: string, guildId: string, adapter
             // Guardar el reproductor actual para detenerlo si es necesario
             currentPlayer = player;
 
+            // Iniciar la reproducción
             player.play(resource);
 
             player.on(AudioPlayerStatus.Playing, () => {
                 console.log('🎶 Reproduciendo audio...');
+                if (disconnectTimeout) {
+                    clearTimeout(disconnectTimeout);
+                    disconnectTimeout = null;
+                }
             });
 
             player.on(AudioPlayerStatus.Idle, () => {
                 console.log('⏸️ Reproducción terminada.');
-                if (connection.state.status !== VoiceConnectionStatus.Destroyed) {
-                    connection.destroy();
-                }
 
                 // Eliminar el archivo de audio temporal después de la reproducción
                 if (fs.existsSync(outputPath)) {
-                    fs.unlinkSync(outputPath);  // Eliminar el archivo después de la reproducción
+                    fs.unlinkSync(outputPath);
                     console.log('✅ Archivo de audio temporal eliminado');
                 }
+
+                // Reiniciar el reproductor para próximas canciones
+                currentPlayer?.stop();
+                currentPlayer = createAudioPlayer();
+                connection.subscribe(currentPlayer);
+                console.log('🔄 Reproductor reiniciado y listo para otra canción.');
+                console.log('✅ Conexión y reproductor listos para siguiente canción.');
+
+                // Programar desconexión si no se recibe nueva música en 5 minutos
+                disconnectTimeout = setTimeout(() => {
+                    console.log('🛑 No se han recibido más canciones. Desconectando...');
+                    if (fs.existsSync(outputPath)) {
+                        fs.unlinkSync(outputPath);
+                        console.log('🧹 Archivo temporal limpiado por inactividad');
+                    }
+                    currentConnection?.destroy();
+                    currentPlayer?.stop();
+                }, 5 * 60 * 1000);
             });
 
             player.on('error', (error) => {
@@ -150,13 +205,14 @@ export async function playMusic(voiceChannelId: string, guildId: string, adapter
 
     } catch (error) {
         if (error instanceof Error) {
-            console.error('❌ Error al obtener el stream o al crear el recurso:', error.message);
+            console.error('❌ Error general:', error.message);
         } else {
-            console.error('❌ Error al obtener el stream o al crear el recurso:', error);
+            console.error('❌ Error inesperado:', error);
         }
-        if (currentConnection) currentConnection.destroy();  // Asegurarse de destruir la conexión en caso de error
+
+        if (currentConnection) currentConnection.destroy();
         if (fs.existsSync(outputPath)) {
-            fs.unlinkSync(outputPath);  // Asegurarse de eliminar el archivo si ocurre un error
+            fs.unlinkSync(outputPath);
             console.log('✅ Archivo de audio temporal eliminado (error)');
         }
     }
