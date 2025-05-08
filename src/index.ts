@@ -1,9 +1,9 @@
 import { Client, GatewayIntentBits, ActionRowBuilder, ButtonBuilder, ButtonStyle, CommandInteractionOptionResolver, GuildMember } from 'discord.js';
 import * as path from 'path';
 import * as fs from 'fs';
-import { playMusic, currentConnection, currentPlayer, setCurrentConnection, setCurrentPlayer } from '../src/commands/music';
+import { queueAndPlay, getQueue, skipCurrentTrack, currentConnection, currentPlayer, setCurrentPlayer } from './commands/music';
 import * as dotenv from 'dotenv';
-import { joinVoiceChannel, createAudioPlayer, VoiceConnectionStatus } from '@discordjs/voice';
+import { createAudioPlayer } from '@discordjs/voice';
 
 dotenv.config();
 
@@ -53,16 +53,16 @@ client.on('messageCreate', async (message) => {
             const row = new ActionRowBuilder<ButtonBuilder>().addComponents(stopButton);
 
             await message.reply({
-                content: `🎶 Reproduciendo ahora: ${query}`,
+                content: `🎶 Añadida a la cola: ${query}`,
                 components: [row],
             });
 
-            await playMusic(
-                message.member.voice.channel.id,
-                message.guild!.id,
-                message.guild!.voiceAdapterCreator,
-                query
-            );
+            await queueAndPlay({
+                url: query,
+                voiceChannelId: message.member.voice.channel.id,
+                guildId: message.guild!.id,
+                adapterCreator: message.guild!.voiceAdapterCreator,
+            });
         }
     } catch (error) {
         console.error('Error en el comando:', error);
@@ -70,11 +70,13 @@ client.on('messageCreate', async (message) => {
     }
 });
 
-// 🎵 Comando slash /tocamela
+// 🎵 Comandos slash
 client.on('interactionCreate', async (interaction) => {
     if (!interaction.isCommand()) return;
 
-    if (interaction.commandName === 'tocamela') {
+    const { commandName } = interaction;
+
+    if (commandName === 'tocamela') {
         const url = (interaction.options as CommandInteractionOptionResolver).getString('url');
         const member = interaction.member as GuildMember;
 
@@ -103,16 +105,16 @@ client.on('interactionCreate', async (interaction) => {
             const row = new ActionRowBuilder<ButtonBuilder>().addComponents(stopButton);
 
             await interaction.reply({
-                content: `🎶 Reproduciendo ahora: ${url}`,
+                content: `🎶 Añadida a la cola: ${url}`,
                 components: [row],
             });
 
-            await playMusic(
-                member.voice.channel.id,
-                interaction.guild!.id,
-                interaction.guild!.voiceAdapterCreator,
-                url!
-            );
+            await queueAndPlay({
+                url: url!,
+                voiceChannelId: member.voice.channel.id,
+                guildId: interaction.guild!.id,
+                adapterCreator: interaction.guild!.voiceAdapterCreator,
+            });
         } catch (error) {
             console.error('Error al intentar reproducir la música:', error);
             await interaction.reply({
@@ -120,6 +122,25 @@ client.on('interactionCreate', async (interaction) => {
                 ephemeral: true
             });
         }
+    }
+
+    if (commandName === 'cola') {
+        const queue = getQueue();
+
+        if (queue.length === 0) {
+            await interaction.reply('📭 No hay canciones en la cola.');
+        } else {
+            const list = queue
+                .map((track, i) => `\`${i + 1}.\` ${track.url}`)
+                .join('\n');
+
+            await interaction.reply(`🎶 Canciones en cola:\n${list}`);
+        }
+    }
+
+    if (commandName === 'skip') {
+        skipCurrentTrack();
+        await interaction.reply('⏭️ Canción actual saltada. Reproduciendo siguiente...');
     }
 });
 
@@ -129,39 +150,35 @@ client.on('interactionCreate', async (interaction) => {
 
     if (interaction.customId === 'stop_music') {
         if (!interaction.guild || !interaction.member || !('voice' in interaction.member)) {
-          await interaction.reply({ content: '❌ No se pudo obtener información del canal de voz.', ephemeral: true });
-          return;
+            await interaction.reply({ content: '❌ No se pudo obtener información del canal de voz.', ephemeral: true });
+            return;
         }
-      
+
         const member = interaction.member as GuildMember;
         const voiceChannel = member.voice.channel;
-      
+
         if (!voiceChannel) {
-          await interaction.reply({ content: '❌ Debes estar en un canal de voz para reiniciar la música.', ephemeral: true });
-          return;
+            await interaction.reply({ content: '❌ Debes estar en un canal de voz para reiniciar la música.', ephemeral: true });
+            return;
         }
-      
-        // 🧹 Limpiar archivo temporal
+
         cleanTempFolder();
-      
-        // 🛑 Detener el reproductor (sin destruir conexión)
         currentPlayer?.stop();
-      
-        // ♻️ Reasociar nuevo reproductor
+
         const newPlayer = createAudioPlayer();
         currentConnection?.subscribe(newPlayer);
-      
+
         setCurrentPlayer(newPlayer);
-      
+
         await interaction.reply({ content: '♻️ Reproductor reiniciado y listo para nueva canción.', ephemeral: true });
-      
+
         console.log('🔁 Reproductor reiniciado sin desconectar del canal');
-      }      
+    }
 });
 
 // 🔧 Función de limpieza de carpeta temporal
 function cleanTempFolder() {
-    const tempPath = path.join(__dirname, '../src/commands');
+    const tempPath = path.join(__dirname, './commands');
     const files = fs.readdirSync(tempPath);
     for (const file of files) {
         if (file.endsWith('.mp3')) {

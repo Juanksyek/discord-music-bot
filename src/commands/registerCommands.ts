@@ -17,23 +17,31 @@ const commands = [
         options: [
             {
                 name: 'nombre',
-                type: 3, // STRING
+                type: 3,
                 description: 'El nombre del canal a crear',
                 required: false,
             },
         ],
     },
     {
-        name: 'tocamela',  // Comando /tocamela
+        name: 'tocamela',
         description: 'Reproduce música en el canal de voz',
         options: [
             {
                 name: 'url',
-                type: 3,  // STRING
+                type: 3,
                 description: 'La URL de la canción o video de YouTube',
                 required: true,
             },
         ],
+    },
+    {
+        name: 'cola',
+        description: 'Muestra la lista de canciones en la cola',
+    },
+    {
+        name: 'skip',
+        description: 'Salta a la siguiente canción en la cola',
     },
 ];
 
