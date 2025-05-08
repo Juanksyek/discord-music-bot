@@ -1,4 +1,12 @@
-import { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus, VoiceConnectionStatus, AudioPlayer, VoiceConnection } from '@discordjs/voice';
+import {
+    joinVoiceChannel,
+    createAudioPlayer,
+    createAudioResource,
+    AudioPlayerStatus,
+    VoiceConnectionStatus,
+    AudioPlayer,
+    VoiceConnection
+} from '@discordjs/voice';
 import { exec } from 'child_process';
 import fs from 'fs';
 import path from 'path';
@@ -6,6 +14,18 @@ import path from 'path';
 export let currentPlayer: AudioPlayer | null = null;
 export let currentConnection: VoiceConnection | null = null;
 let disconnectTimeout: NodeJS.Timeout | null = null;
+
+// Tipo para una solicitud de canción
+type SongRequest = {
+    url: string;
+    voiceChannelId: string;
+    guildId: string;
+    adapterCreator: any;
+};
+
+// Cola y estado actual
+const queue: SongRequest[] = [];
+let isPlaying = false;
 
 // Validar si la URL es de YouTube
 function isValidYouTubeUrl(url: string): boolean {
@@ -25,6 +45,28 @@ export function setCurrentConnection(connection: VoiceConnection | null) {
 
 export function setCurrentPlayer(player: AudioPlayer | null) {
     currentPlayer = player;
+}
+
+// Agregar canción a la cola y reproducir si no hay nada sonando
+export async function queueAndPlay(request: SongRequest) {
+    queue.push(request);
+    if (!isPlaying) {
+        await playNext();
+    }
+}
+
+// Avanzar a la siguiente canción de la cola
+async function playNext() {
+    if (queue.length === 0) {
+        console.log('🎵 Cola vacía. Nada que reproducir.');
+        isPlaying = false;
+        return;
+    }
+
+    const { url, voiceChannelId, guildId, adapterCreator } = queue.shift()!;
+    isPlaying = true;
+
+    await playMusic(voiceChannelId, guildId, adapterCreator, url);
 }
 
 // Función principal para reproducir música en un canal de voz
@@ -100,6 +142,7 @@ export async function playMusic(voiceChannelId: string, guildId: string, adapter
             if (error) {
                 console.error(`❌ Error ejecutando yt-dlp: ${error.message}`);
                 connection.destroy();
+                isPlaying = false;
                 return;
             }
 
@@ -114,6 +157,7 @@ export async function playMusic(voiceChannelId: string, guildId: string, adapter
             if (!fs.existsSync(outputPath)) {
                 console.error('❌ El archivo de audio no se generó. Fallo silencioso de descarga.');
                 connection.destroy();
+                isPlaying = false;
                 return;
             }
 
@@ -125,6 +169,7 @@ export async function playMusic(voiceChannelId: string, guildId: string, adapter
             if (!audioStream || typeof audioStream.pipe !== 'function') {
                 console.error('❌ El stream obtenido no es válido.');
                 connection.destroy();
+                isPlaying = false;
                 return;
             }
 
@@ -140,6 +185,7 @@ export async function playMusic(voiceChannelId: string, guildId: string, adapter
             if (!resource) {
                 console.error('❌ No se pudo crear el recurso de audio.');
                 connection.destroy();
+                isPlaying = false;
                 return;
             }
 
@@ -150,8 +196,6 @@ export async function playMusic(voiceChannelId: string, guildId: string, adapter
             // Crear el reproductor de audio y suscribirlo a la conexión
             const player = createAudioPlayer();
             connection.subscribe(player);
-
-            // Guardar el reproductor actual para detenerlo si es necesario
             currentPlayer = player;
 
             // Iniciar la reproducción
@@ -165,23 +209,21 @@ export async function playMusic(voiceChannelId: string, guildId: string, adapter
                 }
             });
 
-            player.on(AudioPlayerStatus.Idle, () => {
+            player.on(AudioPlayerStatus.Idle, async () => {
                 console.log('⏸️ Reproducción terminada.');
 
-                // Eliminar el archivo de audio temporal después de la reproducción
                 if (fs.existsSync(outputPath)) {
                     fs.unlinkSync(outputPath);
                     console.log('✅ Archivo de audio temporal eliminado');
                 }
 
-                // Reiniciar el reproductor para próximas canciones
                 currentPlayer?.stop();
                 currentPlayer = createAudioPlayer();
                 connection.subscribe(currentPlayer);
                 console.log('🔄 Reproductor reiniciado y listo para otra canción.');
                 console.log('✅ Conexión y reproductor listos para siguiente canción.');
 
-                // Programar desconexión si no se recibe nueva música en 5 minutos
+                // Desconectar si no hay nueva música en 5 minutos
                 disconnectTimeout = setTimeout(() => {
                     console.log('🛑 No se han recibido más canciones. Desconectando...');
                     if (fs.existsSync(outputPath)) {
@@ -190,11 +232,16 @@ export async function playMusic(voiceChannelId: string, guildId: string, adapter
                     }
                     currentConnection?.destroy();
                     currentPlayer?.stop();
+                    isPlaying = false;
                 }, 5 * 60 * 1000);
+
+                // ▶️ Reproducir la siguiente canción de la cola
+                await playNext();
             });
 
             player.on('error', (error) => {
                 console.error('❌ Error en el reproductor:', error.message);
+                isPlaying = false;
                 if (error.message.includes('Status code: 410')) {
                     console.error('❌ El recurso solicitado ya no está disponible.');
                 } else {
@@ -204,6 +251,7 @@ export async function playMusic(voiceChannelId: string, guildId: string, adapter
         });
 
     } catch (error) {
+        isPlaying = false;
         if (error instanceof Error) {
             console.error('❌ Error general:', error.message);
         } else {
@@ -217,3 +265,16 @@ export async function playMusic(voiceChannelId: string, guildId: string, adapter
         }
     }
 }
+
+// Obtener la cola actual
+export function getQueue(): SongRequest[] {
+    return [...queue];
+}
+
+// Saltar la canción actual
+export function skipCurrentTrack() {
+    if (currentPlayer) {
+        console.log('⏭️ Saltando canción actual...');
+        currentPlayer.stop(); // disparará playNext() automáticamente
+    }
+}  
