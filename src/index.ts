@@ -129,56 +129,34 @@ client.on('interactionCreate', async (interaction) => {
 
     if (interaction.customId === 'stop_music') {
         if (!interaction.guild || !interaction.member || !('voice' in interaction.member)) {
-            await interaction.reply({
-                content: '❌ No se pudo obtener información del canal de voz.',
-                ephemeral: true
-            });
-            return;
+          await interaction.reply({ content: '❌ No se pudo obtener información del canal de voz.', ephemeral: true });
+          return;
         }
-
+      
         const member = interaction.member as GuildMember;
         const voiceChannel = member.voice.channel;
-
+      
         if (!voiceChannel) {
-            await interaction.reply({
-                content: '❌ Debes estar en un canal de voz para reiniciar la música.',
-                ephemeral: true
-            });
-            return;
+          await interaction.reply({ content: '❌ Debes estar en un canal de voz para reiniciar la música.', ephemeral: true });
+          return;
         }
-
+      
+        // 🧹 Limpiar archivo temporal
         cleanTempFolder();
-
+      
+        // 🛑 Detener el reproductor (sin destruir conexión)
         currentPlayer?.stop();
-        currentConnection?.destroy();
-
-        await interaction.reply({
-            content: '♻️ Reiniciando reproducción y reconectando...',
-            ephemeral: true
-        });
-
-        const connection = joinVoiceChannel({
-            channelId: voiceChannel.id,
-            guildId: voiceChannel.guild.id,
-            adapterCreator: voiceChannel.guild.voiceAdapterCreator,
-        });
-
-        connection.on(VoiceConnectionStatus.Ready, () => {
-            console.log('✅ Conexión lista para transmitir audio');
-        });
-
-        connection.on('stateChange', (oldState, newState) => {
-            console.log(`Estado de conexión cambiado: ${oldState.status} -> ${newState.status}`);
-        });
-
-        setCurrentConnection(connection);
-
-        const player = createAudioPlayer();
-        connection.subscribe(player);
-        setCurrentPlayer(player);
-
-        console.log('🎵 Conexión y reproductor reiniciados y listos.');
-    }
+      
+        // ♻️ Reasociar nuevo reproductor
+        const newPlayer = createAudioPlayer();
+        currentConnection?.subscribe(newPlayer);
+      
+        setCurrentPlayer(newPlayer);
+      
+        await interaction.reply({ content: '♻️ Reproductor reiniciado y listo para nueva canción.', ephemeral: true });
+      
+        console.log('🔁 Reproductor reiniciado sin desconectar del canal');
+      }      
 });
 
 // 🔧 Función de limpieza de carpeta temporal
