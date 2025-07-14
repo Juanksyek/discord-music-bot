@@ -91,101 +91,103 @@ client.on('messageCreate', async (message) => {
 client.on('interactionCreate', async (interaction) => {
     console.log(`🔹 Interacción recibida: ${interaction.type}`);
 
-    if (!interaction.isCommand()) return;
+    if (interaction.isCommand()) {
+        const { commandName } = interaction;
+        console.log(`🟢 Comando recibido: ${commandName}`);
 
-    const { commandName } = interaction;
-    console.log(`🟢 Comando recibido: ${commandName}`);
+        if (commandName === 'tocamela') {
+            const url = (interaction.options as CommandInteractionOptionResolver).getString('url');
+            const member = interaction.member as GuildMember;
 
-    if (commandName === 'tocamela') {
-        const url = (interaction.options as CommandInteractionOptionResolver).getString('url');
-        const member = interaction.member as GuildMember;
+            console.log(`🎶 Ejecutando /tocamela con URL: ${url}`);
 
-        console.log(`🎶 Comando /tocamela ejecutado por ${interaction.user.username} con URL: ${url}`);
-
-        if (!member.voice.channel || !isValidYouTubeUrl(url)) {
-            return interaction.reply({ content: '❌ Debes estar en un canal de voz y proporcionar una URL válida.', ephemeral: true });
-        }
-
-        await interaction.deferReply();
-
-        try {
-            await queueAndPlay({
-                url: url!,
-                voiceChannelId: member.voice.channel.id,
-                guildId: interaction.guild!.id,
-                adapterCreator: interaction.guild!.voiceAdapterCreator,
-            });
-
-            const embed = createNowPlayingEmbed(url!, member.user.username);
-            const buttons = createControlButtons();
-
-            await interaction.editReply({ embeds: [embed], components: [buttons] });
-            console.log('✅ Embed enviado correctamente');
-
-        } catch (error) {
-            console.error('❌ Error al reproducir en /tocamela:', error);
-            await interaction.editReply({ content: '❌ Ocurrió un error al intentar reproducir la canción.' });
-        }
-    }
-
-    if (commandName === 'cola') {
-        const queue = getQueue();
-        const list = queue.length
-            ? queue.map((track, i) => `\`${i + 1}.\` ${track.url}`).join('\n')
-            : '📭 Cola vacía.';
-        await interaction.reply({ content: list, ephemeral: true });
-    }
-
-    if (commandName === 'skip') {
-        skipCurrentTrack();
-        await interaction.reply('⏭️ Canción actual saltada.');
-    }
-});
-
-// Botones
-client.on('interactionCreate', async (interaction) => {
-    if (!interaction.isButton()) return;
-
-    switch (interaction.customId) {
-        case 'pause_play':
-            if (!currentPlayer) {
-                await interaction.reply({ content: '❌ No hay nada reproduciendo.', ephemeral: true });
-                return;
+            if (!member.voice.channel || !isValidYouTubeUrl(url)) {
+                return interaction.reply({
+                    content: '❌ Debes estar en un canal de voz y proporcionar una URL válida.',
+                    ephemeral: true
+                });
             }
 
-            if (isPaused) {
-                currentPlayer.unpause();
-                isPaused = false;
-                await interaction.reply({ content: '▶️ Reanudado.', ephemeral: true });
-            } else {
-                currentPlayer.pause();
-                isPaused = true;
-                await interaction.reply({ content: '⏸️ En pausa.', ephemeral: true });
+            await interaction.deferReply();
+
+            try {
+                await queueAndPlay({
+                    url: url!,
+                    voiceChannelId: member.voice.channel.id,
+                    guildId: interaction.guild!.id,
+                    adapterCreator: interaction.guild!.voiceAdapterCreator,
+                });
+
+                const embed = createNowPlayingEmbed(url!, member.user.username);
+                const buttons = createControlButtons();
+
+                await interaction.editReply({ embeds: [embed], components: [buttons] });
+                console.log('✅ Embed enviado');
+
+            } catch (err) {
+                console.error('❌ Error en /tocamela:', err);
+                await interaction.editReply({ content: '❌ Error al reproducir la canción.' });
             }
-            break;
+        }
 
-        case 'skip':
-            skipCurrentTrack();
-            await interaction.reply({ content: '⏭️ Canción saltada.', ephemeral: true });
-            break;
-
-        case 'queue':
+        if (commandName === 'cola') {
             const queue = getQueue();
             const list = queue.length
                 ? queue.map((track, i) => `\`${i + 1}.\` ${track.url}`).join('\n')
                 : '📭 Cola vacía.';
             await interaction.reply({ content: list, ephemeral: true });
-            break;
+        }
 
-        case 'stop':
-            cleanTempFolder();
-            currentPlayer?.stop();
-            const newPlayer = createAudioPlayer();
-            currentConnection?.subscribe(newPlayer);
-            setCurrentPlayer(newPlayer);
-            isPaused = false;
-            await interaction.reply({ content: '⏹ Reproductor reiniciado.', ephemeral: true });
-            break;
+        if (commandName === 'skip') {
+            skipCurrentTrack();
+            await interaction.reply('⏭️ Canción actual saltada.');
+        }
+    }
+
+    if (interaction.isButton()) {
+        console.log(`🟦 Botón presionado: ${interaction.customId}`);
+
+        switch (interaction.customId) {
+            case 'pause_play':
+                if (!currentPlayer) {
+                    await interaction.reply({ content: '❌ No hay nada reproduciendo.', ephemeral: true });
+                    return;
+                }
+
+                if (isPaused) {
+                    currentPlayer.unpause();
+                    isPaused = false;
+                    await interaction.reply({ content: '▶️ Reanudado.', ephemeral: true });
+                } else {
+                    currentPlayer.pause();
+                    isPaused = true;
+                    await interaction.reply({ content: '⏸️ En pausa.', ephemeral: true });
+                }
+                break;
+
+            case 'skip':
+                skipCurrentTrack();
+                await interaction.reply({ content: '⏭️ Canción saltada.', ephemeral: true });
+                break;
+
+            case 'queue':
+                const queue = getQueue();
+                const list = queue.length
+                    ? queue.map((track, i) => `\`${i + 1}.\` ${track.url}`).join('\n')
+                    : '📭 Cola vacía.';
+                await interaction.reply({ content: list, ephemeral: true });
+                break;
+
+            case 'stop':
+                cleanTempFolder();
+                currentPlayer?.stop();
+                const newPlayer = createAudioPlayer();
+                currentConnection?.subscribe(newPlayer);
+                setCurrentPlayer(newPlayer);
+                isPaused = false;
+                await interaction.reply({ content: '⏹ Reproductor reiniciado.', ephemeral: true });
+                break;
+        }
     }
 });
 
