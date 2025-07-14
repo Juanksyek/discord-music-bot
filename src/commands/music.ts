@@ -49,8 +49,10 @@ export function setCurrentPlayer(player: AudioPlayer | null) {
 
 // Agregar canción a la cola y reproducir si no hay nada sonando
 export async function queueAndPlay(request: SongRequest) {
+    console.log(`📥 Agregando a cola: ${request.url}`);
     queue.push(request);
     if (!isPlaying) {
+        console.log('🎬 Iniciando reproducción...');
         await playNext();
     }
 }
@@ -58,12 +60,13 @@ export async function queueAndPlay(request: SongRequest) {
 // Avanzar a la siguiente canción de la cola
 async function playNext() {
     if (queue.length === 0) {
-        console.log('🎵 Cola vacía. Nada que reproducir.');
+        console.log('📭 Cola vacía, nada que reproducir.');
         isPlaying = false;
         return;
     }
 
     const { url, voiceChannelId, guildId, adapterCreator } = queue.shift()!;
+    console.log(`▶️ Reproduciendo siguiente canción: ${url}`);
     isPlaying = true;
 
     await playMusic(voiceChannelId, guildId, adapterCreator, url);
