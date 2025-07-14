@@ -96,22 +96,30 @@ client.on('interactionCreate', async (interaction) => {
     if (commandName === 'tocamela') {
         const url = (interaction.options as CommandInteractionOptionResolver).getString('url');
         const member = interaction.member as GuildMember;
-
+    
         if (!member.voice.channel || !isValidYouTubeUrl(url)) {
             return interaction.reply({ content: '❌ Debes estar en un canal de voz y proporcionar una URL válida.', ephemeral: true });
         }
-
-        const embed = createNowPlayingEmbed(url!, member.user.username);
-        const buttons = createControlButtons();
-
-        await interaction.reply({ embeds: [embed], components: [buttons] });
-
-        await queueAndPlay({
-            url: url!,
-            voiceChannelId: member.voice.channel.id,
-            guildId: interaction.guild!.id,
-            adapterCreator: interaction.guild!.voiceAdapterCreator,
-        });
+    
+        await interaction.deferReply();
+    
+        try {
+            await queueAndPlay({
+                url: url!,
+                voiceChannelId: member.voice.channel.id,
+                guildId: interaction.guild!.id,
+                adapterCreator: interaction.guild!.voiceAdapterCreator,
+            });
+    
+            const embed = createNowPlayingEmbed(url!, member.user.username);
+            const buttons = createControlButtons();
+    
+            await interaction.editReply({ embeds: [embed], components: [buttons] });
+    
+        } catch (error) {
+            console.error('❌ Error al reproducir:', error);
+            await interaction.editReply({ content: '❌ Ocurrió un error al intentar reproducir la canción.' });
+        }
     }
 
     if (commandName === 'cola') {
