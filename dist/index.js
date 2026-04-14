@@ -77,6 +77,33 @@ client.on('messageCreate', async (message) => {
 client.login(TOKEN).catch((error) => {
     console.error('❌ Error al iniciar sesión:', error);
 });
+let shutdownPromise = null;
+async function shutdownBot(signal) {
+    if (!shutdownPromise) {
+        shutdownPromise = (async () => {
+            console.log(`🛑 Cerrando bot por ${signal}...`);
+            try {
+                await (0, music_1.shutdownPlayback)();
+            }
+            catch (error) {
+                console.error('❌ Error apagando la reproducción:', error);
+            }
+            client.destroy();
+        })();
+    }
+    return shutdownPromise;
+}
+for (const signal of ['SIGINT', 'SIGTERM', 'SIGUSR2']) {
+    process.once(signal, () => {
+        void shutdownBot(signal).finally(() => {
+            if (signal === 'SIGUSR2') {
+                process.kill(process.pid, signal);
+                return;
+            }
+            process.exit(0);
+        });
+    });
+}
 async function handleSlashCommand(interaction) {
     if (!interaction.inGuild()) {
         await interaction.reply({ embeds: [(0, ui_1.createErrorEmbed)('Este bot solo funciona dentro de servidores.')], ephemeral: true });
@@ -172,11 +199,16 @@ async function handleSlashCommand(interaction) {
         const payload = {
             embeds: [(0, ui_1.createErrorEmbed)(error instanceof Error ? error.message : 'Ocurrió un error inesperado.')],
         };
-        if (interaction.deferred || interaction.replied) {
-            await interaction.editReply(payload);
+        try {
+            if (interaction.deferred || interaction.replied) {
+                await interaction.editReply(payload);
+            }
+            else {
+                await interaction.reply({ ...payload, ephemeral: true });
+            }
         }
-        else {
-            await interaction.reply(payload);
+        catch {
+            // Interaction expiró o ya fue respondida — ignorar silenciosamente
         }
     }
 }
@@ -189,9 +221,10 @@ async function handleButton(interaction) {
     try {
         switch (interaction.customId) {
             case 'music:toggle': {
+                await interaction.deferReply({ ephemeral: true });
                 const accessError = getPlaybackAccessError(member, interaction.guildId);
                 if (accessError) {
-                    await interaction.reply({ embeds: [(0, ui_1.createErrorEmbed)(accessError)], ephemeral: true });
+                    await interaction.editReply({ embeds: [(0, ui_1.createErrorEmbed)(accessError)] });
                     return;
                 }
                 const result = await (0, music_1.togglePause)(interaction.guildId);
@@ -200,20 +233,24 @@ async function handleButton(interaction) {
                     : result === 'resumed'
                         ? (0, ui_1.createInfoEmbed)('▶️ Reanudado', 'La reproducción volvió a sonar.')
                         : (0, ui_1.createErrorEmbed)('No hay nada reproduciéndose ahora mismo.');
-                await interaction.reply({ embeds: [embed], ephemeral: true });
+                await interaction.editReply({ embeds: [embed] });
                 return;
             }
             case 'music:skip':
-                await interaction.reply({ embeds: [await buildSkipEmbed(interaction.guildId, member)], ephemeral: true });
+                await interaction.deferReply({ ephemeral: true });
+                await interaction.editReply({ embeds: [await buildSkipEmbed(interaction.guildId, member)] });
                 return;
             case 'music:queue':
-                await interaction.reply({ embeds: [(0, ui_1.createQueueEmbed)((0, music_1.getSnapshot)(interaction.guildId))], ephemeral: true });
+                await interaction.deferReply({ ephemeral: true });
+                await interaction.editReply({ embeds: [(0, ui_1.createQueueEmbed)((0, music_1.getSnapshot)(interaction.guildId))] });
                 return;
             case 'music:shuffle':
-                await interaction.reply({ embeds: [buildShuffleEmbed(interaction.guildId, member)], ephemeral: true });
+                await interaction.deferReply({ ephemeral: true });
+                await interaction.editReply({ embeds: [buildShuffleEmbed(interaction.guildId, member)] });
                 return;
             case 'music:stop':
-                await interaction.reply({ embeds: [await buildStopEmbed(interaction.guildId, member)], ephemeral: true });
+                await interaction.deferReply({ ephemeral: true });
+                await interaction.editReply({ embeds: [await buildStopEmbed(interaction.guildId, member)] });
                 return;
             default:
                 await interaction.reply({ embeds: [(0, ui_1.createErrorEmbed)('Botón no reconocido.')], ephemeral: true });
@@ -221,10 +258,22 @@ async function handleButton(interaction) {
     }
     catch (error) {
         console.error(`❌ Error en botón ${interaction.customId}:`, error);
-        await interaction.reply({
-            embeds: [(0, ui_1.createErrorEmbed)(error instanceof Error ? error.message : 'Ocurrió un error inesperado.')],
-            ephemeral: true,
-        });
+        try {
+            if (interaction.deferred || interaction.replied) {
+                await interaction.editReply({
+                    embeds: [(0, ui_1.createErrorEmbed)(error instanceof Error ? error.message : 'Ocurrió un error inesperado.')],
+                });
+            }
+            else {
+                await interaction.reply({
+                    embeds: [(0, ui_1.createErrorEmbed)(error instanceof Error ? error.message : 'Ocurrió un error inesperado.')],
+                    ephemeral: true,
+                });
+            }
+        }
+        catch {
+            // Interaction expiró o ya fue respondida — ignorar silenciosamente
+        }
     }
 }
 async function handlePrefixCommand(message) {
