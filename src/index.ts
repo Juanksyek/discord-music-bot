@@ -260,6 +260,13 @@ async function handleButton(interaction: ButtonInteraction) {
         switch (interaction.customId) {
             case 'music:toggle': {
                 await interaction.deferReply({ ephemeral: true });
+
+                const toggleSnapshot = getSnapshot(interaction.guildId);
+                if (!toggleSnapshot?.current) {
+                    await interaction.editReply({ embeds: [createErrorEmbed('No hay nada reproduciéndose ahora mismo.')] });
+                    return;
+                }
+
                 const accessError = getPlaybackAccessError(member, interaction.guildId);
                 if (accessError) {
                     await interaction.editReply({ embeds: [createErrorEmbed(accessError)] });
@@ -560,6 +567,11 @@ async function handleTtsRequest({
 }
 
 async function buildPauseEmbed(guildId: string, member: GuildMember) {
+    const snapshot = getSnapshot(guildId);
+    if (!snapshot?.current) {
+        return createErrorEmbed('No hay ninguna pista sonando para pausar.');
+    }
+
     const accessError = getPlaybackAccessError(member, guildId);
     if (accessError) {
         return createErrorEmbed(accessError);
@@ -571,6 +583,11 @@ async function buildPauseEmbed(guildId: string, member: GuildMember) {
 }
 
 async function buildResumeEmbed(guildId: string, member: GuildMember) {
+    const snapshot = getSnapshot(guildId);
+    if (!snapshot?.current) {
+        return createErrorEmbed('No hay una pista pausada para reanudar.');
+    }
+
     const accessError = getPlaybackAccessError(member, guildId);
     if (accessError) {
         return createErrorEmbed(accessError);
@@ -582,6 +599,11 @@ async function buildResumeEmbed(guildId: string, member: GuildMember) {
 }
 
 async function buildSkipEmbed(guildId: string, member: GuildMember) {
+    const snapshot = getSnapshot(guildId);
+    if (!snapshot?.current) {
+        return createErrorEmbed('No hay ninguna pista activa para saltar.');
+    }
+
     const accessError = getPlaybackAccessError(member, guildId);
     if (accessError) {
         return createErrorEmbed(accessError);
@@ -593,6 +615,11 @@ async function buildSkipEmbed(guildId: string, member: GuildMember) {
 }
 
 async function buildStopEmbed(guildId: string, member: GuildMember) {
+    const snapshot = getSnapshot(guildId);
+    if (!snapshot) {
+        return createErrorEmbed('No había una sesión activa para detener.');
+    }
+
     const accessError = getPlaybackAccessError(member, guildId);
     if (accessError) {
         return createErrorEmbed(accessError);
@@ -604,13 +631,22 @@ async function buildStopEmbed(guildId: string, member: GuildMember) {
 }
 
 function buildShuffleEmbed(guildId: string, member: GuildMember) {
+    const snapshot = getSnapshot(guildId);
+    if (!snapshot) {
+        return createErrorEmbed('No hay una sesión activa para mezclar.');
+    }
+
+    if (snapshot.queue.length < 2) {
+        return createErrorEmbed('Necesitas al menos dos pistas en cola para mezclar.');
+    }
+
     const accessError = getPlaybackAccessError(member, guildId);
     if (accessError) {
         return createErrorEmbed(accessError);
     }
 
     const shuffled = shuffleQueue(guildId);
-    return shuffled > 1
+    return shuffled >= 2
         ? createInfoEmbed('🔀 Cola mezclada', `Reorganicé **${shuffled}** pistas pendientes.`)
         : createErrorEmbed('Necesitas al menos dos pistas en cola para mezclar.');
 }
@@ -659,47 +695,61 @@ function buildVolumeEmbed(guildId: string, member: GuildMember, percentage: numb
         : createErrorEmbed('No hay una sesión activa para cambiar el volumen.');
 }
 
+/**
+ * Validates access for playback control operations (pause, skip, stop, shuffle).
+ * Only requires the user to be in a voice channel when there is no active bot session yet.
+ * If the bot is already in a channel, the user just needs to be in the same channel.
+ */
 function getPlaybackAccessError(member: GuildMember, guildId: string) {
-    const channel = member.voice.channel;
-    if (!channel) {
+    const botChannelId = getConnectedChannelId(guildId);
+    const snapshot = getSnapshot(guildId);
+    const hasActiveSession = Boolean(snapshot);
+
+    const userChannel = member.voice.channel;
+
+    // If there is no active session, the user must be in a voice channel to start one
+    if (!hasActiveSession && !userChannel) {
         return 'Debes entrar a un canal de voz primero.';
     }
 
-    const botChannelId = getConnectedChannelId(guildId);
-    if (botChannelId && member.voice.channelId !== botChannelId) {
+    // If the bot is connected to a channel, the user must be in the same channel
+    if (botChannelId && userChannel && member.voice.channelId !== botChannelId) {
         return 'Debes estar en el mismo canal de voz que el bot para usar esa sesión.';
     }
 
-    const botMember = member.guild.members.me;
-    if (!botMember) {
-        return 'No pude encontrar al bot dentro del servidor para revisar permisos.';
-    }
+    // Permission checks only apply when the user is in a voice channel
+    if (userChannel) {
+        const botMember = member.guild.members.me;
+        if (!botMember) {
+            return 'No pude encontrar al bot dentro del servidor para revisar permisos.';
+        }
 
-    const permissions = channel.permissionsFor(botMember);
-    if (!permissions) {
-        return 'No pude comprobar los permisos del bot en ese canal de voz.';
-    }
+        const permissions = userChannel.permissionsFor(botMember);
+        if (!permissions) {
+            return 'No pude comprobar los permisos del bot en ese canal de voz.';
+        }
 
-    const missingPermissions: string[] = [];
+        const missingPermissions: string[] = [];
 
-    if (!permissions.has(PermissionsBitField.Flags.ViewChannel)) {
-        missingPermissions.push('ViewChannel');
-    }
+        if (!permissions.has(PermissionsBitField.Flags.ViewChannel)) {
+            missingPermissions.push('ViewChannel');
+        }
 
-    if (!permissions.has(PermissionsBitField.Flags.Connect)) {
-        missingPermissions.push('Connect');
-    }
+        if (!permissions.has(PermissionsBitField.Flags.Connect)) {
+            missingPermissions.push('Connect');
+        }
 
-    if (!permissions.has(PermissionsBitField.Flags.Speak)) {
-        missingPermissions.push('Speak');
-    }
+        if (!permissions.has(PermissionsBitField.Flags.Speak)) {
+            missingPermissions.push('Speak');
+        }
 
-    if (missingPermissions.length > 0) {
-        return `Al bot le faltan permisos en **${channel.name}**: ${missingPermissions.join(', ')}.`;
-    }
+        if (missingPermissions.length > 0) {
+            return `Al bot le faltan permisos en **${userChannel.name}**: ${missingPermissions.join(', ')}.`;
+        }
 
-    if (channel.userLimit > 0 && channel.members.size >= channel.userLimit && !channel.members.has(botMember.id)) {
-        return `El canal **${channel.name}** está lleno y el bot no puede entrar.`;
+        if (userChannel.userLimit > 0 && userChannel.members.size >= userChannel.userLimit && !userChannel.members.has(botMember.id)) {
+            return `El canal **${userChannel.name}** está lleno y el bot no puede entrar.`;
+        }
     }
 
     return null;

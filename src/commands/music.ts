@@ -192,7 +192,13 @@ export function getSnapshot(guildId: string): PlaybackSnapshot | null {
         return null;
     }
 
-    if (!state.current && state.queue.length === 0 && !state.connection) {
+    if (
+        !state.sessionActive &&
+        !state.current &&
+        state.queue.length === 0 &&
+        !state.connection &&
+        state.player.state.status === AudioPlayerStatus.Idle
+    ) {
         return null;
     }
 
@@ -205,7 +211,11 @@ export function getConnectedChannelId(guildId: string): string | null {
 
 export async function togglePause(guildId: string): Promise<'paused' | 'resumed' | 'noop'> {
     const state = guildStates.get(guildId);
-    if (!state?.current) {
+    if (!state) {
+        return 'noop';
+    }
+
+    if (!state.current && state.player.state.status === AudioPlayerStatus.Idle) {
         return 'noop';
     }
 
@@ -239,17 +249,23 @@ export async function resume(guildId: string): Promise<boolean> {
 
 export async function skip(guildId: string): Promise<boolean> {
     const state = guildStates.get(guildId);
-    if (!state?.current) {
+    if (!state) {
+        return false;
+    }
+
+    // Check if there's anything to skip before acquiring the serial lock
+    if (!state.current && state.player.state.status === AudioPlayerStatus.Idle) {
         return false;
     }
 
     return enqueueSerial(state, async () => {
-        if (!state.current) {
+        if (!state.current && state.player.state.status === AudioPlayerStatus.Idle) {
             return false;
         }
 
         destroyCurrentProcess(state);
-        return state.player.stop(true);
+        state.player.stop(true);
+        return true;
     });
 }
 
@@ -260,7 +276,13 @@ export async function stop(guildId: string): Promise<boolean> {
     }
 
     return enqueueSerial(state, async () => {
-        const hadSession = hasActivePlaybackSession(state) || Boolean(state.connection);
+        const hadSession =
+            state.sessionActive ||
+            Boolean(state.current) ||
+            state.queue.length > 0 ||
+            Boolean(state.connection) ||
+            state.player.state.status !== AudioPlayerStatus.Idle;
+
         if (!hadSession) {
             return false;
         }
