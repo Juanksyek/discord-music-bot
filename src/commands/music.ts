@@ -96,6 +96,12 @@ type GuildPlaybackState = {
     volume: number;
     textChannel: AnnouncementChannel | null;
     disconnectTimeout: NodeJS.Timeout | null;
+    sessionActive: boolean;
+    voiceChannelId: string | null;
+    adapterCreator: DiscordGatewayAdapterCreator | null;
+    suppressNextIdleEvent: boolean;
+    // Serializes concurrent playback mutations per guild to prevent race conditions
+    enqueueChain: Promise<void>;
 };
 
 const guildStates = new Map<string, GuildPlaybackState>();
@@ -104,62 +110,80 @@ export async function enqueueMusic(request: EnqueueMusicRequest): Promise<Enqueu
     const state = getOrCreateState(request.guildId);
     state.textChannel = request.textChannel ?? state.textChannel;
 
-    // Do ALL async work before touching state
+    // Resolve tracks outside the serial lock — safe to run in parallel
     const resolved = await resolveMusicTracks(request.query, request.requestedBy, request.requestedById);
-    await ensureConnection(state, request.voiceChannelId, request.adapterCreator);
 
-    // Check AFTER all awaits — no await between here and the push, so this is atomic
-    const alreadyPlaying = Boolean(state.current) || state.player.state.status !== AudioPlayerStatus.Idle;
-    const startedImmediately = !alreadyPlaying;
-    const firstQueuedPosition = alreadyPlaying ? state.queue.length + 1 : 0;
+    // Serialize state mutations per guild so concurrent commands don't race
+    return enqueueSerial(state, async () => {
+        state.voiceChannelId = request.voiceChannelId;
+        state.adapterCreator = request.adapterCreator;
 
-    state.queue.push(...resolved.tracks);
+        const alreadyPlaying = hasActivePlaybackSession(state);
+        const startedImmediately = !alreadyPlaying;
+        const firstQueuedPosition = alreadyPlaying ? state.queue.length + 1 : 0;
 
-    if (startedImmediately) {
-        await playNext(state, false);
-    }
+        if (!alreadyPlaying) {
+            await ensureConnection(state, request.voiceChannelId, request.adapterCreator);
+            state.sessionActive = true;
+        }
 
-    return {
-        addedTracks: resolved.tracks,
-        startedImmediately,
-        firstQueuedPosition,
-        playlistTitle: resolved.playlistTitle,
-    };
+        state.queue.push(...resolved.tracks);
+
+        if (startedImmediately) {
+            await playNext(state, false);
+        }
+
+        return {
+            addedTracks: resolved.tracks,
+            startedImmediately,
+            firstQueuedPosition,
+            playlistTitle: resolved.playlistTitle,
+        };
+    });
 }
 
 export async function enqueueTts(request: EnqueueTtsRequest): Promise<EnqueueTtsResult> {
     const state = getOrCreateState(request.guildId);
     state.textChannel = request.textChannel ?? state.textChannel;
 
-    await ensureConnection(state, request.voiceChannelId, request.adapterCreator);
-
+    // Generate TTS audio outside the serial lock
     const generated = await generateTtsAudio(request.text, request.voiceKey);
-    const preview = request.text.length > 40 ? `${request.text.slice(0, 39)}…` : request.text;
 
-    const track: QueueTrack = {
-        id: randomUUID(),
-        kind: 'tts',
-        title: `${generated.preset.label}: ${preview}`,
-        requestedBy: request.requestedBy,
-        requestedById: request.requestedById,
-        sourceLabel: generated.preset.label,
-        durationLabel: 'TTS',
-        filePath: generated.filePath,
-    };
+    return enqueueSerial(state, async () => {
+        state.voiceChannelId = request.voiceChannelId;
+        state.adapterCreator = request.adapterCreator;
 
-    // Check AFTER all awaits — atomic with the push below
-    const alreadyPlaying = Boolean(state.current) || state.player.state.status !== AudioPlayerStatus.Idle;
-    const startedImmediately = !alreadyPlaying;
-    const willPlayNext = alreadyPlaying;
+        const preview = request.text.length > 40 ? `${request.text.slice(0, 39)}…` : request.text;
 
-    if (startedImmediately) {
-        state.queue.push(track);
-        await playNext(state, false);
-    } else {
-        state.queue.unshift(track);
-    }
+        const track: QueueTrack = {
+            id: randomUUID(),
+            kind: 'tts',
+            title: `${generated.preset.label}: ${preview}`,
+            requestedBy: request.requestedBy,
+            requestedById: request.requestedById,
+            sourceLabel: generated.preset.label,
+            durationLabel: 'TTS',
+            filePath: generated.filePath,
+        };
 
-    return { track, startedImmediately, willPlayNext };
+        const alreadyPlaying = hasActivePlaybackSession(state);
+        const startedImmediately = !alreadyPlaying;
+        const willPlayNext = alreadyPlaying;
+
+        if (!alreadyPlaying) {
+            await ensureConnection(state, request.voiceChannelId, request.adapterCreator);
+            state.sessionActive = true;
+        }
+
+        if (startedImmediately) {
+            state.queue.push(track);
+            await playNext(state, false);
+        } else {
+            state.queue.unshift(track);
+        }
+
+        return { track, startedImmediately, willPlayNext };
+    });
 }
 
 export function getSnapshot(guildId: string): PlaybackSnapshot | null {
@@ -219,7 +243,14 @@ export async function skip(guildId: string): Promise<boolean> {
         return false;
     }
 
-    return state.player.stop();
+    return enqueueSerial(state, async () => {
+        if (!state.current) {
+            return false;
+        }
+
+        destroyCurrentProcess(state);
+        return state.player.stop(true);
+    });
 }
 
 export async function stop(guildId: string): Promise<boolean> {
@@ -228,28 +259,39 @@ export async function stop(guildId: string): Promise<boolean> {
         return false;
     }
 
-    clearDisconnectTimer(state);
+    return enqueueSerial(state, async () => {
+        const hadSession = hasActivePlaybackSession(state) || Boolean(state.connection);
+        if (!hadSession) {
+            return false;
+        }
 
-    if (state.currentProcess) {
-        state.currentProcess.kill('SIGTERM');
-        state.currentProcess = null;
-    }
+        clearDisconnectTimer(state);
+        state.suppressNextIdleEvent = true;
 
-    await cleanupTrack(state.current);
-    await Promise.all(state.queue.map((track) => cleanupTrack(track)));
+        const currentTrack = state.current;
+        const queuedTracks = [...state.queue];
 
-    state.current = null;
-    state.currentResource = null;
-    state.queue = [];
+        destroyCurrentProcess(state);
 
-    state.player.stop(true);
+        state.current = null;
+        state.currentResource = null;
+        state.queue = [];
+        state.sessionActive = false;
+        state.voiceChannelId = null;
+        state.adapterCreator = null;
 
-    if (state.connection) {
-        state.connection.destroy();
-        state.connection = null;
-    }
+        state.player.stop(true);
 
-    return true;
+        if (state.connection) {
+            state.connection.destroy();
+            state.connection = null;
+        }
+
+        await cleanupTrack(currentTrack);
+        await Promise.all(queuedTracks.map((track) => cleanupTrack(track)));
+
+        return true;
+    });
 }
 
 export async function clearQueue(guildId: string): Promise<number> {
@@ -258,10 +300,12 @@ export async function clearQueue(guildId: string): Promise<number> {
         return 0;
     }
 
-    const removed = [...state.queue];
-    state.queue = [];
-    await Promise.all(removed.map((track) => cleanupTrack(track)));
-    return removed.length;
+    return enqueueSerial(state, async () => {
+        const removed = [...state.queue];
+        state.queue = [];
+        await Promise.all(removed.map((track) => cleanupTrack(track)));
+        return removed.length;
+    });
 }
 
 export async function removeFromQueue(guildId: string, position: number): Promise<QueueTrack | null> {
@@ -270,9 +314,15 @@ export async function removeFromQueue(guildId: string, position: number): Promis
         return null;
     }
 
-    const [removed] = state.queue.splice(position - 1, 1);
-    await cleanupTrack(removed);
-    return removed ?? null;
+    return enqueueSerial(state, async () => {
+        if (position < 1 || position > state.queue.length) {
+            return null;
+        }
+
+        const [removed] = state.queue.splice(position - 1, 1);
+        await cleanupTrack(removed);
+        return removed ?? null;
+    });
 }
 
 export function shuffleQueue(guildId: string): number {
@@ -322,20 +372,56 @@ function getOrCreateState(guildId: string): GuildPlaybackState {
         volume: DEFAULT_VOLUME,
         textChannel: null,
         disconnectTimeout: null,
+        sessionActive: false,
+        voiceChannelId: null,
+        adapterCreator: null,
+        suppressNextIdleEvent: false,
+        enqueueChain: Promise.resolve(),
     };
 
     state.player.on(AudioPlayerStatus.Idle, () => {
-        void handleTrackEnd(state);
+        void enqueueSerial(state, async () => {
+            await handleTrackEnd(state);
+        });
     });
 
     state.player.on('error', (error) => {
         console.error(`[${guildId}] Error de reproducción:`, error);
-        void announceError(state, `No pude reproducir **${state.current?.title ?? 'la pista actual'}**. Paso a la siguiente.`);
-        state.player.stop(true);
+        void enqueueSerial(state, async () => {
+            const failedTrack = state.current;
+            destroyCurrentProcess(state);
+            state.current = null;
+            state.currentResource = null;
+
+            await cleanupTrack(failedTrack);
+            await announceError(state, `No pude reproducir **${failedTrack?.title ?? 'la pista actual'}**. Paso a la siguiente.`);
+            await playNext(state, true);
+        });
     });
 
     guildStates.set(guildId, state);
     return state;
+}
+
+/** Runs `fn` after the guild's current enqueue operation completes, preventing concurrent state races. */
+function enqueueSerial<T>(state: GuildPlaybackState, fn: () => Promise<T>): Promise<T> {
+    const result = state.enqueueChain.then(fn);
+    state.enqueueChain = result.then(
+        () => {},
+        () => {},
+    );
+    return result;
+}
+
+function hasActivePlaybackSession(state: GuildPlaybackState): boolean {
+    return (
+        state.sessionActive ||
+        Boolean(state.current) ||
+        state.queue.length > 0 ||
+        state.currentResource !== null ||
+        state.currentProcess !== null ||
+        state.player.state.status !== AudioPlayerStatus.Idle
+    );
 }
 
 async function ensureConnection(
@@ -379,23 +465,12 @@ async function ensureConnection(
             selfDeaf: true,
         });
 
-        connection.on('stateChange', (oldState, newState) => {
+        connection.on('stateChange', (_, newState) => {
             console.log(`[${state.guildId}] Voz intento ${attempt}: ${newState.status}`);
+        });
 
-            if (
-                oldState.status !== VoiceConnectionStatus.Disconnected &&
-                newState.status === VoiceConnectionStatus.Disconnected
-            ) {
-                if (connection.rejoinAttempts < 5) {
-                    setTimeout(() => {
-                        if (connection.state.status === VoiceConnectionStatus.Disconnected) {
-                            connection.rejoin();
-                        }
-                    }, 1_000);
-                } else if (connection.state.status !== VoiceConnectionStatus.Destroyed) {
-                    connection.destroy();
-                }
-            }
+        connection.on('debug', (msg) => {
+            console.log(`[${state.guildId}] [voice debug] ${msg}`);
         });
 
         connection.on('error', (error) => {
@@ -428,22 +503,30 @@ async function ensureConnection(
 async function playNext(state: GuildPlaybackState, announce: boolean): Promise<void> {
     clearDisconnectTimer(state);
 
-    if (state.currentProcess) {
-        state.currentProcess.kill('SIGTERM');
-        state.currentProcess = null;
-    }
+    destroyCurrentProcess(state);
 
     const nextTrack = state.queue.shift();
     if (!nextTrack) {
         state.current = null;
         state.currentResource = null;
+        state.currentProcess = null;
+        state.sessionActive = false;
         scheduleDisconnect(state);
         return;
     }
 
     state.current = nextTrack;
+    state.sessionActive = true;
 
     try {
+        if (!state.connection || state.connection.state.status !== VoiceConnectionStatus.Ready) {
+            if (!state.voiceChannelId || !state.adapterCreator) {
+                throw new Error('No tengo contexto del canal de voz para continuar la sesión.');
+            }
+
+            await ensureConnection(state, state.voiceChannelId, state.adapterCreator);
+        }
+
         const { resource, process: ytProcess } = await createResource(nextTrack);
         resource.volume?.setVolume(state.volume);
 
@@ -466,9 +549,15 @@ async function playNext(state: GuildPlaybackState, announce: boolean): Promise<v
 }
 
 async function handleTrackEnd(state: GuildPlaybackState): Promise<void> {
+    if (state.suppressNextIdleEvent) {
+        state.suppressNextIdleEvent = false;
+        return;
+    }
+
     const finishedTrack = state.current;
     state.current = null;
     state.currentResource = null;
+    state.currentProcess = null;
     await cleanupTrack(finishedTrack);
     await playNext(state, true);
 }
@@ -734,6 +823,29 @@ function clearDisconnectTimer(state: GuildPlaybackState): void {
         clearTimeout(state.disconnectTimeout);
         state.disconnectTimeout = null;
     }
+}
+
+function destroyCurrentProcess(state: GuildPlaybackState): void {
+    const activeProcess = state.currentProcess;
+    if (!activeProcess) {
+        return;
+    }
+
+    activeProcess.stdout?.destroy();
+    activeProcess.stderr?.destroy();
+
+    try {
+        activeProcess.kill();
+    } catch {
+        // El proceso ya terminó o no pudo recibir la señal.
+    }
+
+    state.currentProcess = null;
+}
+
+export async function shutdownPlayback(): Promise<void> {
+    const activeGuilds = [...guildStates.keys()];
+    await Promise.all(activeGuilds.map((guildId) => stop(guildId)));
 }
 
 async function cleanupTrack(track: QueueTrack | null): Promise<void> {
