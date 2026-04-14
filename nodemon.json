@@ -1,0 +1,13 @@
+{
+  "watch": ["src", "package.json", "tsconfig.json"],
+  "ext": "ts,json",
+  "ignore": [
+    "**/dist/**",
+    "**/node_modules/**",
+    "**/*-player-script.js",
+    "**/--Frag*",
+    "**/.git/**"
+  ],
+  "delay": "500ms",
+  "exec": "ts-node src/index.ts"
+}
