@@ -87,17 +87,20 @@ function createQueueEmbed(snapshot) {
         .setTitle('📋 Cola actual')
         .setFooter({ text: BRAND_FOOTER });
     if (snapshot.current) {
-        embed.setDescription(`**Ahora:** ${formatTrack(snapshot.current)}\nVolumen **${snapshot.volumePercent}%** • ${snapshot.isPaused ? 'Pausado' : 'Reproduciendo'}`);
+        embed.addFields({
+            name: 'Sonando ahora',
+            value: `${formatTrack(snapshot.current)}\nSolicitada por **${escapeInline(snapshot.current.requestedBy)}**\nVolumen **${snapshot.volumePercent}%** • ${snapshot.isPaused ? 'Pausado' : 'Reproduciendo'}`,
+        });
     }
     if (snapshot.queue.length === 0) {
         embed.addFields({
-            name: 'Siguiente',
-            value: 'No hay más pistas esperando.',
+            name: 'Pendientes',
+            value: 'No hay más canciones en espera.',
         });
         return embed;
     }
-    const visibleTracks = snapshot.queue.slice(0, 8);
-    const lines = visibleTracks.map((track, index) => `\`${index + 1}.\` ${formatTrack(track)}`);
+    const visibleTracks = snapshot.queue.slice(0, 10);
+    const lines = visibleTracks.map((track, index) => `\`${index + 1}.\` ${formatTrack(track)}\nSolicitada por **${escapeInline(track.requestedBy)}**`);
     if (snapshot.queue.length > visibleTracks.length) {
         lines.push(`… y **${snapshot.queue.length - visibleTracks.length}** más.`);
     }
