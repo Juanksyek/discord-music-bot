@@ -16,7 +16,9 @@ exports.clearQueue = clearQueue;
 exports.removeFromQueue = removeFromQueue;
 exports.shuffleQueue = shuffleQueue;
 exports.setVolume = setVolume;
+exports.shutdownPlayback = shutdownPlayback;
 const voice_1 = require("@discordjs/voice");
+const child_process_1 = require("child_process");
 const play_dl_1 = __importDefault(require("play-dl"));
 const crypto_1 = require("crypto");
 const tts_1 = require("../lib/tts");
@@ -30,47 +32,66 @@ const guildStates = new Map();
 async function enqueueMusic(request) {
     const state = getOrCreateState(request.guildId);
     state.textChannel = request.textChannel ?? state.textChannel;
+    // Resolve tracks outside the serial lock — safe to run in parallel
     const resolved = await resolveMusicTracks(request.query, request.requestedBy, request.requestedById);
-    const startedImmediately = !state.current && state.queue.length === 0;
-    const firstQueuedPosition = startedImmediately ? 0 : state.queue.length + 1;
-    await ensureConnection(state, request.voiceChannelId, request.adapterCreator);
-    state.queue.push(...resolved.tracks);
-    if (startedImmediately) {
-        await playNext(state, false);
-    }
-    return {
-        addedTracks: resolved.tracks,
-        startedImmediately,
-        firstQueuedPosition,
-        playlistTitle: resolved.playlistTitle,
-    };
+    // Serialize state mutations per guild so concurrent commands don't race
+    return enqueueSerial(state, async () => {
+        state.voiceChannelId = request.voiceChannelId;
+        state.adapterCreator = request.adapterCreator;
+        const alreadyPlaying = hasActivePlaybackSession(state);
+        const startedImmediately = !alreadyPlaying;
+        const firstQueuedPosition = alreadyPlaying ? state.queue.length + 1 : 0;
+        if (!alreadyPlaying) {
+            await ensureConnection(state, request.voiceChannelId, request.adapterCreator);
+            state.sessionActive = true;
+        }
+        state.queue.push(...resolved.tracks);
+        if (startedImmediately) {
+            await playNext(state, false);
+        }
+        return {
+            addedTracks: resolved.tracks,
+            startedImmediately,
+            firstQueuedPosition,
+            playlistTitle: resolved.playlistTitle,
+        };
+    });
 }
 async function enqueueTts(request) {
     const state = getOrCreateState(request.guildId);
     state.textChannel = request.textChannel ?? state.textChannel;
-    await ensureConnection(state, request.voiceChannelId, request.adapterCreator);
+    // Generate TTS audio outside the serial lock
     const generated = await (0, tts_1.generateTtsAudio)(request.text, request.voiceKey);
-    const preview = request.text.length > 40 ? `${request.text.slice(0, 39)}…` : request.text;
-    const track = {
-        id: (0, crypto_1.randomUUID)(),
-        kind: 'tts',
-        title: `${generated.preset.label}: ${preview}`,
-        requestedBy: request.requestedBy,
-        requestedById: request.requestedById,
-        sourceLabel: generated.preset.label,
-        durationLabel: 'TTS',
-        filePath: generated.filePath,
-    };
-    const startedImmediately = !state.current && state.queue.length === 0;
-    const willPlayNext = Boolean(state.current);
-    if (startedImmediately) {
-        state.queue.push(track);
-        await playNext(state, false);
-    }
-    else {
-        state.queue.unshift(track);
-    }
-    return { track, startedImmediately, willPlayNext };
+    return enqueueSerial(state, async () => {
+        state.voiceChannelId = request.voiceChannelId;
+        state.adapterCreator = request.adapterCreator;
+        const preview = request.text.length > 40 ? `${request.text.slice(0, 39)}…` : request.text;
+        const track = {
+            id: (0, crypto_1.randomUUID)(),
+            kind: 'tts',
+            title: `${generated.preset.label}: ${preview}`,
+            requestedBy: request.requestedBy,
+            requestedById: request.requestedById,
+            sourceLabel: generated.preset.label,
+            durationLabel: 'TTS',
+            filePath: generated.filePath,
+        };
+        const alreadyPlaying = hasActivePlaybackSession(state);
+        const startedImmediately = !alreadyPlaying;
+        const willPlayNext = alreadyPlaying;
+        if (!alreadyPlaying) {
+            await ensureConnection(state, request.voiceChannelId, request.adapterCreator);
+            state.sessionActive = true;
+        }
+        if (startedImmediately) {
+            state.queue.push(track);
+            await playNext(state, false);
+        }
+        else {
+            state.queue.unshift(track);
+        }
+        return { track, startedImmediately, willPlayNext };
+    });
 }
 function getSnapshot(guildId) {
     const state = guildStates.get(guildId);
@@ -117,44 +138,70 @@ async function skip(guildId) {
     if (!state?.current) {
         return false;
     }
-    return state.player.stop();
+    return enqueueSerial(state, async () => {
+        if (!state.current) {
+            return false;
+        }
+        destroyCurrentProcess(state);
+        return state.player.stop(true);
+    });
 }
 async function stop(guildId) {
     const state = guildStates.get(guildId);
     if (!state) {
         return false;
     }
-    clearDisconnectTimer(state);
-    await cleanupTrack(state.current);
-    await Promise.all(state.queue.map((track) => cleanupTrack(track)));
-    state.current = null;
-    state.currentResource = null;
-    state.queue = [];
-    state.player.stop(true);
-    if (state.connection) {
-        state.connection.destroy();
-        state.connection = null;
-    }
-    return true;
+    return enqueueSerial(state, async () => {
+        const hadSession = hasActivePlaybackSession(state) || Boolean(state.connection);
+        if (!hadSession) {
+            return false;
+        }
+        clearDisconnectTimer(state);
+        state.suppressNextIdleEvent = true;
+        const currentTrack = state.current;
+        const queuedTracks = [...state.queue];
+        destroyCurrentProcess(state);
+        state.current = null;
+        state.currentResource = null;
+        state.queue = [];
+        state.sessionActive = false;
+        state.voiceChannelId = null;
+        state.adapterCreator = null;
+        state.player.stop(true);
+        if (state.connection) {
+            state.connection.destroy();
+            state.connection = null;
+        }
+        await cleanupTrack(currentTrack);
+        await Promise.all(queuedTracks.map((track) => cleanupTrack(track)));
+        return true;
+    });
 }
 async function clearQueue(guildId) {
     const state = guildStates.get(guildId);
     if (!state || state.queue.length === 0) {
         return 0;
     }
-    const removed = [...state.queue];
-    state.queue = [];
-    await Promise.all(removed.map((track) => cleanupTrack(track)));
-    return removed.length;
+    return enqueueSerial(state, async () => {
+        const removed = [...state.queue];
+        state.queue = [];
+        await Promise.all(removed.map((track) => cleanupTrack(track)));
+        return removed.length;
+    });
 }
 async function removeFromQueue(guildId, position) {
     const state = guildStates.get(guildId);
     if (!state || position < 1 || position > state.queue.length) {
         return null;
     }
-    const [removed] = state.queue.splice(position - 1, 1);
-    await cleanupTrack(removed);
-    return removed ?? null;
+    return enqueueSerial(state, async () => {
+        if (position < 1 || position > state.queue.length) {
+            return null;
+        }
+        const [removed] = state.queue.splice(position - 1, 1);
+        await cleanupTrack(removed);
+        return removed ?? null;
+    });
 }
 function shuffleQueue(guildId) {
     const state = guildStates.get(guildId);
@@ -193,20 +240,49 @@ function getOrCreateState(guildId) {
         queue: [],
         current: null,
         currentResource: null,
+        currentProcess: null,
         volume: DEFAULT_VOLUME,
         textChannel: null,
         disconnectTimeout: null,
+        sessionActive: false,
+        voiceChannelId: null,
+        adapterCreator: null,
+        suppressNextIdleEvent: false,
+        enqueueChain: Promise.resolve(),
     };
     state.player.on(voice_1.AudioPlayerStatus.Idle, () => {
-        void handleTrackEnd(state);
+        void enqueueSerial(state, async () => {
+            await handleTrackEnd(state);
+        });
     });
     state.player.on('error', (error) => {
         console.error(`[${guildId}] Error de reproducción:`, error);
-        void announceError(state, `No pude reproducir **${state.current?.title ?? 'la pista actual'}**. Paso a la siguiente.`);
-        state.player.stop(true);
+        void enqueueSerial(state, async () => {
+            const failedTrack = state.current;
+            destroyCurrentProcess(state);
+            state.current = null;
+            state.currentResource = null;
+            await cleanupTrack(failedTrack);
+            await announceError(state, `No pude reproducir **${failedTrack?.title ?? 'la pista actual'}**. Paso a la siguiente.`);
+            await playNext(state, true);
+        });
     });
     guildStates.set(guildId, state);
     return state;
+}
+/** Runs `fn` after the guild's current enqueue operation completes, preventing concurrent state races. */
+function enqueueSerial(state, fn) {
+    const result = state.enqueueChain.then(fn);
+    state.enqueueChain = result.then(() => { }, () => { });
+    return result;
+}
+function hasActivePlaybackSession(state) {
+    return (state.sessionActive ||
+        Boolean(state.current) ||
+        state.queue.length > 0 ||
+        state.currentResource !== null ||
+        state.currentProcess !== null ||
+        state.player.state.status !== voice_1.AudioPlayerStatus.Idle);
 }
 async function ensureConnection(state, voiceChannelId, adapterCreator) {
     clearDisconnectTimer(state);
@@ -233,8 +309,6 @@ async function ensureConnection(state, voiceChannelId, adapterCreator) {
         state.connection.destroy();
         state.connection = null;
     }
-    let lastStatus = 'none';
-    let lastErrorMessage = '';
     for (let attempt = 1; attempt <= VOICE_RETRY_ATTEMPTS; attempt += 1) {
         const connection = (0, voice_1.joinVoiceChannel)({
             channelId: voiceChannelId,
@@ -242,16 +316,13 @@ async function ensureConnection(state, voiceChannelId, adapterCreator) {
             adapterCreator,
             selfDeaf: true,
         });
-        lastStatus = connection.state.status;
-        lastErrorMessage = '';
         connection.on('stateChange', (_, newState) => {
-            if (newState.status !== voice_1.VoiceConnectionStatus.Destroyed) {
-                lastStatus = newState.status;
-            }
             console.log(`[${state.guildId}] Voz intento ${attempt}: ${newState.status}`);
         });
+        connection.on('debug', (msg) => {
+            console.log(`[${state.guildId}] [voice debug] ${msg}`);
+        });
         connection.on('error', (error) => {
-            lastErrorMessage = error instanceof Error ? error.message : String(error);
             console.error(`[${state.guildId}] Error de conexión de voz:`, error);
         });
         connection.subscribe(state.player);
@@ -261,12 +332,12 @@ async function ensureConnection(state, voiceChannelId, adapterCreator) {
             return;
         }
         catch (error) {
-            const statusBeforeDestroy = lastStatus;
-            const waitErrorMessage = error instanceof Error ? error.message : String(error);
-            connection.destroy();
+            if (connection.state.status !== voice_1.VoiceConnectionStatus.Destroyed) {
+                connection.destroy();
+            }
             state.connection = null;
             if (attempt === VOICE_RETRY_ATTEMPTS) {
-                throw new Error(`No pude conectarme al canal de voz tras ${VOICE_RETRY_ATTEMPTS} intentos. Estado previo al cierre: ${statusBeforeDestroy}. ${lastErrorMessage || waitErrorMessage}.`);
+                throw new Error(`No pude conectarme al canal de voz tras ${VOICE_RETRY_ATTEMPTS} intentos. ${error instanceof Error ? error.message : String(error)}`);
             }
             await delay(1_250);
         }
@@ -274,18 +345,29 @@ async function ensureConnection(state, voiceChannelId, adapterCreator) {
 }
 async function playNext(state, announce) {
     clearDisconnectTimer(state);
+    destroyCurrentProcess(state);
     const nextTrack = state.queue.shift();
     if (!nextTrack) {
         state.current = null;
         state.currentResource = null;
+        state.currentProcess = null;
+        state.sessionActive = false;
         scheduleDisconnect(state);
         return;
     }
     state.current = nextTrack;
+    state.sessionActive = true;
     try {
-        const resource = await createResource(nextTrack);
+        if (!state.connection || state.connection.state.status !== voice_1.VoiceConnectionStatus.Ready) {
+            if (!state.voiceChannelId || !state.adapterCreator) {
+                throw new Error('No tengo contexto del canal de voz para continuar la sesión.');
+            }
+            await ensureConnection(state, state.voiceChannelId, state.adapterCreator);
+        }
+        const { resource, process: ytProcess } = await createResource(nextTrack);
         resource.volume?.setVolume(state.volume);
         state.currentResource = resource;
+        state.currentProcess = ytProcess;
         state.player.play(resource);
         if (announce) {
             await announceNowPlaying(state);
@@ -296,14 +378,20 @@ async function playNext(state, announce) {
         await cleanupTrack(nextTrack);
         state.current = null;
         state.currentResource = null;
+        state.currentProcess = null;
         await announceError(state, `No pude preparar **${nextTrack.title}**. Intento con la siguiente.`);
         await playNext(state, announce);
     }
 }
 async function handleTrackEnd(state) {
+    if (state.suppressNextIdleEvent) {
+        state.suppressNextIdleEvent = false;
+        return;
+    }
     const finishedTrack = state.current;
     state.current = null;
     state.currentResource = null;
+    state.currentProcess = null;
     await cleanupTrack(finishedTrack);
     await playNext(state, true);
 }
@@ -312,20 +400,39 @@ async function createResource(track) {
         if (!track.filePath) {
             throw new Error('El archivo TTS no existe.');
         }
-        return (0, voice_1.createAudioResource)(track.filePath, {
-            inlineVolume: true,
-            metadata: track,
-        });
+        return {
+            resource: (0, voice_1.createAudioResource)(track.filePath, {
+                inlineVolume: true,
+                metadata: track,
+            }),
+            process: null,
+        };
     }
     if (!track.url) {
         throw new Error('La pista no tiene URL válida.');
     }
-    const stream = await play_dl_1.default.stream(track.url);
-    return (0, voice_1.createAudioResource)(stream.stream, {
-        inlineVolume: true,
-        inputType: mapPlayDlStreamType(stream.type),
-        metadata: track,
+    const ytdlp = (0, child_process_1.spawn)('yt-dlp', [
+        '-f', 'bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio',
+        '-o', '-',
+        '--quiet',
+        '--no-playlist',
+        '--no-warnings',
+        track.url,
+    ]);
+    ytdlp.stderr.on('data', (data) => {
+        const msg = data.toString().trim();
+        if (msg) {
+            console.warn(`[yt-dlp] ${msg}`);
+        }
     });
+    return {
+        resource: (0, voice_1.createAudioResource)(ytdlp.stdout, {
+            inlineVolume: true,
+            inputType: voice_1.StreamType.Arbitrary,
+            metadata: track,
+        }),
+        process: ytdlp,
+    };
 }
 async function resolveMusicTracks(query, requestedBy, requestedById) {
     const directTarget = extractYouTubeTarget(query);
@@ -500,6 +607,25 @@ function clearDisconnectTimer(state) {
         state.disconnectTimeout = null;
     }
 }
+function destroyCurrentProcess(state) {
+    const activeProcess = state.currentProcess;
+    if (!activeProcess) {
+        return;
+    }
+    activeProcess.stdout?.destroy();
+    activeProcess.stderr?.destroy();
+    try {
+        activeProcess.kill();
+    }
+    catch {
+        // El proceso ya terminó o no pudo recibir la señal.
+    }
+    state.currentProcess = null;
+}
+async function shutdownPlayback() {
+    const activeGuilds = [...guildStates.keys()];
+    await Promise.all(activeGuilds.map((guildId) => stop(guildId)));
+}
 async function cleanupTrack(track) {
     if (!track || track.kind !== 'tts') {
         return;
@@ -538,20 +664,6 @@ async function announceError(state, message) {
     }).catch((error) => {
         console.warn(`[${state.guildId}] No pude anunciar un error:`, error);
     });
-}
-function mapPlayDlStreamType(type) {
-    switch (type) {
-        case 'webm/opus':
-            return voice_1.StreamType.WebmOpus;
-        case 'ogg/opus':
-            return voice_1.StreamType.OggOpus;
-        case 'opus':
-            return voice_1.StreamType.Opus;
-        case 'raw':
-            return voice_1.StreamType.Raw;
-        default:
-            return voice_1.StreamType.Arbitrary;
-    }
 }
 function delay(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
