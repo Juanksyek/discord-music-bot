@@ -20,6 +20,7 @@ import {
     removeFromQueue,
     resume,
     setVolume,
+    shutdownPlayback,
     shuffleQueue,
     skip,
     stop,
@@ -87,6 +88,39 @@ client.on('messageCreate', async (message) => {
 client.login(TOKEN).catch((error) => {
     console.error('❌ Error al iniciar sesión:', error);
 });
+
+let shutdownPromise: Promise<void> | null = null;
+
+async function shutdownBot(signal: NodeJS.Signals): Promise<void> {
+    if (!shutdownPromise) {
+        shutdownPromise = (async () => {
+            console.log(`🛑 Cerrando bot por ${signal}...`);
+
+            try {
+                await shutdownPlayback();
+            } catch (error) {
+                console.error('❌ Error apagando la reproducción:', error);
+            }
+
+            client.destroy();
+        })();
+    }
+
+    return shutdownPromise;
+}
+
+for (const signal of ['SIGINT', 'SIGTERM', 'SIGUSR2'] as const) {
+    process.once(signal, () => {
+        void shutdownBot(signal).finally(() => {
+            if (signal === 'SIGUSR2') {
+                process.kill(process.pid, signal);
+                return;
+            }
+
+            process.exit(0);
+        });
+    });
+}
 
 async function handleSlashCommand(interaction: ChatInputCommandInteraction) {
     if (!interaction.inGuild()) {
@@ -225,9 +259,10 @@ async function handleButton(interaction: ButtonInteraction) {
     try {
         switch (interaction.customId) {
             case 'music:toggle': {
+                await interaction.deferReply({ ephemeral: true });
                 const accessError = getPlaybackAccessError(member, interaction.guildId);
                 if (accessError) {
-                    await interaction.reply({ embeds: [createErrorEmbed(accessError)], ephemeral: true });
+                    await interaction.editReply({ embeds: [createErrorEmbed(accessError)] });
                     return;
                 }
 
@@ -239,12 +274,13 @@ async function handleButton(interaction: ButtonInteraction) {
                             ? createInfoEmbed('▶️ Reanudado', 'La reproducción volvió a sonar.')
                             : createErrorEmbed('No hay nada reproduciéndose ahora mismo.');
 
-                await interaction.reply({ embeds: [embed], ephemeral: true });
+                await interaction.editReply({ embeds: [embed] });
                 return;
             }
 
             case 'music:skip':
-                await interaction.reply({ embeds: [await buildSkipEmbed(interaction.guildId, member)], ephemeral: true });
+                await interaction.deferReply({ ephemeral: true });
+                await interaction.editReply({ embeds: [await buildSkipEmbed(interaction.guildId, member)] });
                 return;
 
             case 'music:queue':
@@ -252,11 +288,13 @@ async function handleButton(interaction: ButtonInteraction) {
                 return;
 
             case 'music:shuffle':
-                await interaction.reply({ embeds: [buildShuffleEmbed(interaction.guildId, member)], ephemeral: true });
+                await interaction.deferReply({ ephemeral: true });
+                await interaction.editReply({ embeds: [buildShuffleEmbed(interaction.guildId, member)] });
                 return;
 
             case 'music:stop':
-                await interaction.reply({ embeds: [await buildStopEmbed(interaction.guildId, member)], ephemeral: true });
+                await interaction.deferReply({ ephemeral: true });
+                await interaction.editReply({ embeds: [await buildStopEmbed(interaction.guildId, member)] });
                 return;
 
             default:
