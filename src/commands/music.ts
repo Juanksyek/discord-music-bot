@@ -110,11 +110,11 @@ export async function enqueueMusic(request: EnqueueMusicRequest): Promise<Enqueu
     const state = getOrCreateState(request.guildId);
     state.textChannel = request.textChannel ?? state.textChannel;
 
-    // Resolve tracks outside the serial lock — safe to run in parallel
-    const resolved = await resolveMusicTracks(request.query, request.requestedBy, request.requestedById);
-
     // Serialize state mutations per guild so concurrent commands don't race
     return enqueueSerial(state, async () => {
+        // Resolve tracks inside the serial lock to preserve request ordering
+        const resolved = await resolveMusicTracks(request.query, request.requestedBy, request.requestedById);
+
         state.voiceChannelId = request.voiceChannelId;
         state.adapterCreator = request.adapterCreator;
 
@@ -146,10 +146,10 @@ export async function enqueueTts(request: EnqueueTtsRequest): Promise<EnqueueTts
     const state = getOrCreateState(request.guildId);
     state.textChannel = request.textChannel ?? state.textChannel;
 
-    // Generate TTS audio outside the serial lock
-    const generated = await generateTtsAudio(request.text, request.voiceKey);
-
+    // Serialize TTS generation and queue mutation to preserve ordering
     return enqueueSerial(state, async () => {
+        const generated = await generateTtsAudio(request.text, request.voiceKey);
+
         state.voiceChannelId = request.voiceChannelId;
         state.adapterCreator = request.adapterCreator;
 
@@ -220,31 +220,51 @@ export async function togglePause(guildId: string): Promise<'paused' | 'resumed'
     }
 
     const status = state.player.state.status;
-    if (status === AudioPlayerStatus.Paused || status === AudioPlayerStatus.AutoPaused) {
-        state.player.unpause();
-        return 'resumed';
-    }
+        console.log(`[${guildId}] togglePause - status=${status} current=${state.current?.title ?? 'null'} queue=${state.queue.length} sessionActive=${state.sessionActive}`);
+
+        if (status === AudioPlayerStatus.Paused || status === AudioPlayerStatus.AutoPaused) {
+            const resumed = state.player.unpause();
+            console.log(`[${guildId}] togglePause -> resumed=${resumed}`);
+            return resumed ? 'resumed' : 'noop';
+        }
 
     const paused = state.player.pause(true);
+    console.log(`[${guildId}] togglePause -> paused=${paused}`);
     return paused ? 'paused' : 'noop';
 }
 
 export async function pause(guildId: string): Promise<boolean> {
     const state = guildStates.get(guildId);
-    if (!state?.current) {
+    if (!state) {
         return false;
     }
 
-    return state.player.pause(true);
+    const status = state.player.state.status;
+    console.log(`[${guildId}] pause() called - status=${status} current=${state.current?.title ?? 'null'} queue=${state.queue.length}`);
+    if (status === AudioPlayerStatus.Playing || status === AudioPlayerStatus.Buffering) {
+        const result = state.player.pause(true);
+        console.log(`[${guildId}] pause -> ${result}`);
+        return result;
+    }
+
+    return false;
 }
 
 export async function resume(guildId: string): Promise<boolean> {
     const state = guildStates.get(guildId);
-    if (!state?.current) {
+    if (!state) {
         return false;
     }
 
-    return state.player.unpause();
+    const status = state.player.state.status;
+    console.log(`[${guildId}] resume() called - status=${status} current=${state.current?.title ?? 'null'} queue=${state.queue.length}`);
+    if (status === AudioPlayerStatus.Paused || status === AudioPlayerStatus.AutoPaused) {
+        const result = state.player.unpause();
+        console.log(`[${guildId}] resume -> ${result}`);
+        return result;
+    }
+
+    return false;
 }
 
 export async function skip(guildId: string): Promise<boolean> {
@@ -254,18 +274,23 @@ export async function skip(guildId: string): Promise<boolean> {
     }
 
     // Check if there's anything to skip before acquiring the serial lock
-    if (!state.current && state.player.state.status === AudioPlayerStatus.Idle) {
+    const status = state.player.state.status;
+    console.log(`[${guildId}] skip() called - status=${status} current=${state.current?.title ?? 'null'} queue=${state.queue.length}`);
+    if (!state.current && status === AudioPlayerStatus.Idle) {
         return false;
     }
 
     return enqueueSerial(state, async () => {
-        if (!state.current && state.player.state.status === AudioPlayerStatus.Idle) {
+        const innerStatus = state.player.state.status;
+        console.log(`[${state.guildId}] skip (inside lock) - status=${innerStatus} current=${state.current?.title ?? 'null'} queue=${state.queue.length}`);
+        if (!state.current && innerStatus === AudioPlayerStatus.Idle) {
             return false;
         }
 
         destroyCurrentProcess(state);
-        state.player.stop(true);
-        return true;
+        const stopped = state.player.stop(true);
+        console.log(`[${state.guildId}] skip -> stopped=${stopped}`);
+        return stopped;
     });
 }
 
@@ -276,6 +301,7 @@ export async function stop(guildId: string): Promise<boolean> {
     }
 
     return enqueueSerial(state, async () => {
+        console.log(`[${guildId}] stop() called - current=${state.current?.title ?? 'null'} queue=${state.queue.length} sessionActive=${state.sessionActive} connection=${Boolean(state.connection)}`);
         const hadSession =
             state.sessionActive ||
             Boolean(state.current) ||
@@ -284,6 +310,7 @@ export async function stop(guildId: string): Promise<boolean> {
             state.player.state.status !== AudioPlayerStatus.Idle;
 
         if (!hadSession) {
+            console.log(`[${guildId}] stop -> no active session`);
             return false;
         }
 
@@ -524,6 +551,12 @@ async function ensureConnection(
 
 async function playNext(state: GuildPlaybackState, announce: boolean): Promise<void> {
     clearDisconnectTimer(state);
+
+    // Prevent starting a new resource if the player is already busy
+    if (state.player.state.status !== AudioPlayerStatus.Idle && state.currentResource) {
+        console.warn(`[${state.guildId}] playNext called while player busy — skipping start.`);
+        return;
+    }
 
     destroyCurrentProcess(state);
 
