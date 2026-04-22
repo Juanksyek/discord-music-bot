@@ -13,7 +13,6 @@ import {
     type AnnouncementChannel,
     clearQueue,
     enqueueMusic,
-    enqueueTts,
     getConnectedChannelId,
     getSnapshot,
     pause,
@@ -21,7 +20,6 @@ import {
     resume,
     setVolume,
     shutdownPlayback,
-    shuffleQueue,
     skip,
     stop,
     togglePause,
@@ -34,9 +32,7 @@ import {
     createNowPlayingEmbed,
     createPlaylistEmbed,
     createQueueEmbed,
-    createTtsGuideEmbed,
     createQueuedEmbed,
-    createTtsVoicesEmbed,
 } from './lib/ui';
 
 dotenv.config();
@@ -58,10 +54,10 @@ const client = new Client({
 });
 
 client.once('ready', () => {
-    console.log(`✅ ${client.user?.tag ?? 'Bot'} listo con ${slashCommands.length} comandos.`);
+    console.log(`Bot listo: ${client.user?.tag ?? 'Bot'} con ${slashCommands.length} comandos.`);
 
     client.user?.setPresence({
-        activities: [{ name: '/tocamela | /tts | /ayuda' }],
+        activities: [{ name: '/tocamela | /ayuda' }],
         status: 'online',
     });
 });
@@ -86,7 +82,7 @@ client.on('messageCreate', async (message) => {
 });
 
 client.login(TOKEN).catch((error) => {
-    console.error('❌ Error al iniciar sesión:', error);
+    console.error('Error al iniciar sesion:', error);
 });
 
 let shutdownPromise: Promise<void> | null = null;
@@ -94,12 +90,12 @@ let shutdownPromise: Promise<void> | null = null;
 async function shutdownBot(signal: NodeJS.Signals): Promise<void> {
     if (!shutdownPromise) {
         shutdownPromise = (async () => {
-            console.log(`🛑 Cerrando bot por ${signal}...`);
+            console.log(`Cerrando bot por ${signal}...`);
 
             try {
                 await shutdownPlayback();
             } catch (error) {
-                console.error('❌ Error apagando la reproducción:', error);
+                console.error('Error apagando la reproduccion:', error);
             }
 
             client.destroy();
@@ -151,7 +147,7 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction) {
             case 'ahora': {
                 const snapshot = getSnapshot(interaction.guildId);
                 await interaction.reply({
-                    embeds: [snapshot ? createNowPlayingEmbed(snapshot) : createInfoEmbed('📭 Nada sonando', 'Usa `/tocamela` para empezar una sesión.')],
+                    embeds: [snapshot ? createNowPlayingEmbed(snapshot) : createInfoEmbed('Nada sonando', 'Usa `/tocamela` para empezar una sesion.')],
                     components: snapshot?.current ? [createControlButtons()] : [],
                 });
                 return;
@@ -173,10 +169,6 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction) {
                 await interaction.reply({ embeds: [await buildStopEmbed(interaction.guildId, member)] });
                 return;
 
-            case 'mezclar':
-                await interaction.reply({ embeds: [buildShuffleEmbed(interaction.guildId, member)] });
-                return;
-
             case 'limpiar':
                 await interaction.reply({ embeds: [await buildClearEmbed(interaction.guildId, member)] });
                 return;
@@ -196,44 +188,24 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction) {
             case 'panel': {
                 const snapshot = getSnapshot(interaction.guildId);
                 await interaction.reply({
-                    embeds: [snapshot ? createNowPlayingEmbed(snapshot) : createInfoEmbed('🎛 Panel listo', 'No hay nada sonando todavía. Usa `/tocamela` o `/tts`.')],
+                    embeds: [snapshot ? createNowPlayingEmbed(snapshot) : createInfoEmbed('Panel listo', 'No hay nada sonando todavia. Usa `/tocamela`.')],
                     components: [createControlButtons()],
                 });
                 return;
             }
-
-            case 'tts':
-                await interaction.deferReply();
-                await handleTtsRequest({
-                    guildId: interaction.guildId,
-                    member,
-                    textChannel: asTextChannel(interaction.channel),
-                    voiceKey: interaction.options.getString('voz', true),
-                    text: interaction.options.getString('texto', true),
-                    reply: (payload) => interaction.editReply(payload),
-                });
-                return;
-
-            case 'voces':
-                await interaction.reply({ embeds: [createTtsVoicesEmbed()] });
-                return;
-
-            case 'ttsguia':
-                await interaction.reply({ embeds: [createTtsGuideEmbed()] });
-                return;
 
             case 'ayuda':
                 await interaction.reply({ embeds: [createHelpEmbed()] });
                 return;
 
             default:
-                await interaction.reply({ embeds: [createErrorEmbed('Ese comando todavía no está conectado.')] });
+                await interaction.reply({ embeds: [createErrorEmbed('Ese comando todavia no esta conectado.')], ephemeral: true });
         }
     } catch (error) {
-        console.error(`❌ Error en comando ${interaction.commandName}:`, error);
+        console.error(`Error en comando ${interaction.commandName}:`, error);
 
         const payload = {
-            embeds: [createErrorEmbed(error instanceof Error ? error.message : 'Ocurrió un error inesperado.')],
+            embeds: [createErrorEmbed(error instanceof Error ? error.message : 'Ocurrio un error inesperado.')],
         };
 
         try {
@@ -243,7 +215,7 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction) {
                 await interaction.reply({ ...payload, ephemeral: true });
             }
         } catch {
-            // Interaction expiró o ya fue respondida — ignorar silenciosamente
+            // Interaction expiro o ya fue respondida
         }
     }
 }
@@ -261,12 +233,6 @@ async function handleButton(interaction: ButtonInteraction) {
             case 'music:toggle': {
                 await interaction.deferReply({ ephemeral: true });
 
-                const toggleSnapshot = getSnapshot(interaction.guildId);
-                if (!toggleSnapshot?.current) {
-                    await interaction.editReply({ embeds: [createErrorEmbed('No hay nada reproduciéndose ahora mismo.')] });
-                    return;
-                }
-
                 const accessError = getPlaybackAccessError(member, interaction.guildId);
                 if (accessError) {
                     await interaction.editReply({ embeds: [createErrorEmbed(accessError)] });
@@ -276,10 +242,10 @@ async function handleButton(interaction: ButtonInteraction) {
                 const result = await togglePause(interaction.guildId);
                 const embed =
                     result === 'paused'
-                        ? createInfoEmbed('⏸ En pausa', 'La reproducción quedó pausada.')
+                        ? createInfoEmbed('En pausa', 'La reproduccion quedo pausada.')
                         : result === 'resumed'
-                            ? createInfoEmbed('▶️ Reanudado', 'La reproducción volvió a sonar.')
-                            : createErrorEmbed('No hay nada reproduciéndose ahora mismo.');
+                            ? createInfoEmbed('Reanudado', 'La reproduccion volvio a sonar.')
+                            : createErrorEmbed('No hay nada reproduciendose ahora mismo.');
 
                 await interaction.editReply({ embeds: [embed] });
                 return;
@@ -294,34 +260,29 @@ async function handleButton(interaction: ButtonInteraction) {
                 await interaction.reply({ embeds: [createQueueEmbed(getSnapshot(interaction.guildId))], ephemeral: true });
                 return;
 
-            case 'music:shuffle':
-                await interaction.deferReply({ ephemeral: true });
-                await interaction.editReply({ embeds: [buildShuffleEmbed(interaction.guildId, member)] });
-                return;
-
             case 'music:stop':
                 await interaction.deferReply({ ephemeral: true });
                 await interaction.editReply({ embeds: [await buildStopEmbed(interaction.guildId, member)] });
                 return;
 
             default:
-                await interaction.reply({ embeds: [createErrorEmbed('Botón no reconocido.')], ephemeral: true });
+                await interaction.reply({ embeds: [createErrorEmbed('Boton no reconocido.')], ephemeral: true });
         }
     } catch (error) {
-        console.error(`❌ Error en botón ${interaction.customId}:`, error);
+        console.error(`Error en boton ${interaction.customId}:`, error);
         try {
             if (interaction.deferred || interaction.replied) {
                 await interaction.editReply({
-                    embeds: [createErrorEmbed(error instanceof Error ? error.message : 'Ocurrió un error inesperado.')],
+                    embeds: [createErrorEmbed(error instanceof Error ? error.message : 'Ocurrio un error inesperado.')],
                 });
             } else {
                 await interaction.reply({
-                    embeds: [createErrorEmbed(error instanceof Error ? error.message : 'Ocurrió un error inesperado.')],
+                    embeds: [createErrorEmbed(error instanceof Error ? error.message : 'Ocurrio un error inesperado.')],
                     ephemeral: true,
                 });
             }
         } catch {
-            // Interaction expiró o ya fue respondida — ignorar silenciosamente
+            // Interaction expiro o ya fue respondida
         }
     }
 }
@@ -355,7 +316,7 @@ async function handlePrefixCommand(message: Message<true>) {
             case 'ahora': {
                 const snapshot = getSnapshot(message.guildId);
                 await message.reply({
-                    embeds: [snapshot ? createNowPlayingEmbed(snapshot) : createInfoEmbed('📭 Nada sonando', 'Usa `!play` o `/tocamela` para empezar.')],
+                    embeds: [snapshot ? createNowPlayingEmbed(snapshot) : createInfoEmbed('Nada sonando', 'Usa `!play` o `/tocamela` para empezar.')],
                     components: snapshot?.current ? [createControlButtons()] : [],
                 });
                 return;
@@ -377,10 +338,6 @@ async function handlePrefixCommand(message: Message<true>) {
                 await message.reply({ embeds: [await buildStopEmbed(message.guildId, member)] });
                 return;
 
-            case 'mezclar':
-                await message.reply({ embeds: [buildShuffleEmbed(message.guildId, member)] });
-                return;
-
             case 'limpiar':
                 await message.reply({ embeds: [await buildClearEmbed(message.guildId, member)] });
                 return;
@@ -393,31 +350,10 @@ async function handlePrefixCommand(message: Message<true>) {
                 await message.reply({ embeds: [buildVolumeEmbed(message.guildId, member, Number(args[0]))] });
                 return;
 
-            case 'tts':
-                await handleTtsRequest({
-                    guildId: message.guildId,
-                    member,
-                    textChannel: asTextChannel(message.channel),
-                    voiceKey: args[0],
-                    text: args.slice(1).join(' '),
-                    reply: (payload) => message.reply(payload),
-                });
-                return;
-
-            case 'voces':
-                await message.reply({ embeds: [createTtsVoicesEmbed()] });
-                return;
-
-            case 'ttsguia':
-            case 'guiatts':
-            case 'ttshelp':
-                await message.reply({ embeds: [createTtsGuideEmbed()] });
-                return;
-
             case 'panel': {
                 const snapshot = getSnapshot(message.guildId);
                 await message.reply({
-                    embeds: [snapshot ? createNowPlayingEmbed(snapshot) : createInfoEmbed('🎛 Panel listo', 'No hay nada sonando todavía. Usa `!play` o `/tocamela`.')],
+                    embeds: [snapshot ? createNowPlayingEmbed(snapshot) : createInfoEmbed('Panel listo', 'No hay nada sonando todavia. Usa `!play` o `/tocamela`.')],
                     components: [createControlButtons()],
                 });
                 return;
@@ -432,9 +368,9 @@ async function handlePrefixCommand(message: Message<true>) {
                 return;
         }
     } catch (error) {
-        console.error(`❌ Error en prefijo ${command}:`, error);
+        console.error(`Error en prefijo ${command}:`, error);
         await message.reply({
-            embeds: [createErrorEmbed(error instanceof Error ? error.message : 'Ocurrió un error inesperado.')],
+            embeds: [createErrorEmbed(error instanceof Error ? error.message : 'Ocurrio un error inesperado.')],
         });
     }
 }
@@ -459,7 +395,7 @@ async function handlePlayRequest({
     }
 
     if (!query.trim()) {
-        await reply({ embeds: [createErrorEmbed('Escribe una URL o una búsqueda para reproducir.')] });
+        await reply({ embeds: [createErrorEmbed('Escribe una URL o una busqueda para reproducir.')] });
         return;
     }
 
@@ -475,7 +411,7 @@ async function handlePlayRequest({
 
     const snapshot = getSnapshot(guildId);
     if (!snapshot) {
-        await reply({ embeds: [createErrorEmbed('No pude iniciar la reproducción.')] });
+        await reply({ embeds: [createErrorEmbed('No pude iniciar la reproduccion.')] });
         return;
     }
 
@@ -502,153 +438,65 @@ async function handlePlayRequest({
     });
 }
 
-async function handleTtsRequest({
-    guildId,
-    member,
-    textChannel,
-    voiceKey,
-    text,
-    reply,
-}: {
-    guildId: string;
-    member: GuildMember;
-    textChannel: AnnouncementChannel | null;
-    voiceKey: string;
-    text: string;
-    reply: (payload: any) => Promise<unknown>;
-}) {
-    const accessError = getPlaybackAccessError(member, guildId);
-    if (accessError) {
-        await reply({ embeds: [createErrorEmbed(accessError)] });
-        return;
-    }
+// ---- Embed builders ----
 
-    if (!voiceKey || !text.trim()) {
-        await reply({ embeds: [createErrorEmbed('Usa `!tts <voz> <texto>` o `/tts` con ambos campos completos. Si necesitas ejemplos, usa `/ttsguia`.')] });
-        return;
-    }
-
-    const result = await enqueueTts({
-        guildId,
-        voiceChannelId: member.voice.channel!.id,
-        adapterCreator: member.guild.voiceAdapterCreator,
-        voiceKey,
-        text,
-        requestedBy: member.displayName,
-        requestedById: member.id,
-        textChannel,
-    });
-
-    const snapshot = getSnapshot(guildId);
-    if (!snapshot) {
-        await reply({ embeds: [createErrorEmbed('No pude preparar el TTS.')] });
-        return;
-    }
-
-    if (result.startedImmediately) {
-        await reply({
-            embeds: [createNowPlayingEmbed(snapshot)],
-            components: [createControlButtons()],
-        });
-        return;
-    }
-
-    await reply({
-        embeds: [
-            createInfoEmbed(
-                '🗣 TTS en cola',
-                result.willPlayNext
-                    ? `**${result.track.title}** quedó como siguiente audio.`
-                    : `**${result.track.title}** se agregó a la cola.`
-            ),
-        ],
-        components: [createControlButtons()],
-    });
-}
-
+/**
+ * Pause: no pre-check on snapshot.current to avoid races during track transitions.
+ * pause() itself returns false if there is genuinely nothing to pause.
+ */
 async function buildPauseEmbed(guildId: string, member: GuildMember) {
-    const snapshot = getSnapshot(guildId);
-    if (!snapshot?.current) {
-        return createErrorEmbed('No hay ninguna pista sonando para pausar.');
-    }
-
     const accessError = getPlaybackAccessError(member, guildId);
     if (accessError) {
         return createErrorEmbed(accessError);
     }
 
     return (await pause(guildId))
-        ? createInfoEmbed('⏸ En pausa', 'La pista actual quedó pausada.')
+        ? createInfoEmbed('En pausa', 'La pista actual quedo pausada.')
         : createErrorEmbed('No hay ninguna pista sonando para pausar.');
 }
 
+/**
+ * Resume: no pre-check on snapshot.current to avoid races.
+ */
 async function buildResumeEmbed(guildId: string, member: GuildMember) {
-    const snapshot = getSnapshot(guildId);
-    if (!snapshot?.current) {
-        return createErrorEmbed('No hay una pista pausada para reanudar.');
-    }
-
     const accessError = getPlaybackAccessError(member, guildId);
     if (accessError) {
         return createErrorEmbed(accessError);
     }
 
     return (await resume(guildId))
-        ? createInfoEmbed('▶️ Reanudado', 'La reproducción volvió a sonar.')
+        ? createInfoEmbed('Reanudado', 'La reproduccion volvio a sonar.')
         : createErrorEmbed('No hay una pista pausada para reanudar.');
 }
 
+/**
+ * Skip: checks session existence but NOT snapshot.current — that check lived outside the
+ * serial lock and caused false negatives during track transitions (between songs).
+ */
 async function buildSkipEmbed(guildId: string, member: GuildMember) {
-    const snapshot = getSnapshot(guildId);
-    if (!snapshot?.current) {
-        return createErrorEmbed('No hay ninguna pista activa para saltar.');
-    }
-
     const accessError = getPlaybackAccessError(member, guildId);
     if (accessError) {
         return createErrorEmbed(accessError);
     }
 
+    if (!getSnapshot(guildId)) {
+        return createErrorEmbed('No hay una sesion activa para saltar.');
+    }
+
     return (await skip(guildId))
-        ? createInfoEmbed('⏭ Skip', 'Salté la pista actual.')
+        ? createInfoEmbed('Skip', 'Salte la pista actual.')
         : createErrorEmbed('No hay ninguna pista activa para saltar.');
 }
 
 async function buildStopEmbed(guildId: string, member: GuildMember) {
-    const snapshot = getSnapshot(guildId);
-    if (!snapshot) {
-        return createErrorEmbed('No había una sesión activa para detener.');
-    }
-
     const accessError = getPlaybackAccessError(member, guildId);
     if (accessError) {
         return createErrorEmbed(accessError);
     }
 
     return (await stop(guildId))
-        ? createInfoEmbed('⏹ Sesión cerrada', 'Limpié la cola y desconecté el bot del canal de voz.')
-        : createErrorEmbed('No había una sesión activa para detener.');
-}
-
-function buildShuffleEmbed(guildId: string, member: GuildMember) {
-    const snapshot = getSnapshot(guildId);
-    if (!snapshot) {
-        return createErrorEmbed('No hay una sesión activa para mezclar.');
-    }
-
-    if (snapshot.queue.length < 2) {
-        return createErrorEmbed('Necesitas al menos dos pistas en cola para mezclar.');
-    }
-
-    const accessError = getPlaybackAccessError(member, guildId);
-    if (accessError) {
-        return createErrorEmbed(accessError);
-    }
-
-    const shuffled = shuffleQueue(guildId);
-    return shuffled >= 2
-        ? createInfoEmbed('🔀 Cola mezclada', `Reorganicé **${shuffled}** pistas pendientes.`)
-        : createErrorEmbed('Necesitas al menos dos pistas en cola para mezclar.');
+        ? createInfoEmbed('Sesion cerrada', 'Limpie la cola y desconecte el bot del canal de voz.')
+        : createErrorEmbed('No habia una sesion activa para detener.');
 }
 
 async function buildClearEmbed(guildId: string, member: GuildMember) {
@@ -659,8 +507,8 @@ async function buildClearEmbed(guildId: string, member: GuildMember) {
 
     const removed = await clearQueue(guildId);
     return removed > 0
-        ? createInfoEmbed('🧹 Cola limpiada', `Quité **${removed}** pistas pendientes.`)
-        : createErrorEmbed('La cola ya estaba vacía.');
+        ? createInfoEmbed('Cola limpiada', `Quite **${removed}** pistas pendientes.`)
+        : createErrorEmbed('La cola ya estaba vacia.');
 }
 
 async function buildRemoveEmbed(guildId: string, member: GuildMember, position: number) {
@@ -670,13 +518,13 @@ async function buildRemoveEmbed(guildId: string, member: GuildMember, position: 
     }
 
     if (!Number.isInteger(position) || position < 1) {
-        return createErrorEmbed('Indica una posición válida dentro de la cola.');
+        return createErrorEmbed('Indica una posicion valida dentro de la cola.');
     }
 
     const removed = await removeFromQueue(guildId, position);
     return removed
-        ? createInfoEmbed('🗑 Pista eliminada', `Quité **${removed.title}** de la cola.`)
-        : createErrorEmbed('No encontré esa posición dentro de la cola.');
+        ? createInfoEmbed('Pista eliminada', `Quite **${removed.title}** de la cola.`)
+        : createErrorEmbed('No encontre esa posicion dentro de la cola.');
 }
 
 function buildVolumeEmbed(guildId: string, member: GuildMember, percentage: number) {
@@ -686,20 +534,17 @@ function buildVolumeEmbed(guildId: string, member: GuildMember, percentage: numb
     }
 
     if (!Number.isInteger(percentage)) {
-        return createErrorEmbed('Escribe un valor numérico entre 5 y 200.');
+        return createErrorEmbed('Escribe un valor numerico entre 5 y 200.');
     }
 
     const applied = setVolume(guildId, percentage);
     return applied
-        ? createInfoEmbed('🔊 Volumen actualizado', `El reproductor quedó en **${applied}%**.`)
-        : createErrorEmbed('No hay una sesión activa para cambiar el volumen.');
+        ? createInfoEmbed('Volumen actualizado', `El reproductor quedo en **${applied}%**.`)
+        : createErrorEmbed('No hay una sesion activa para cambiar el volumen.');
 }
 
-/**
- * Validates access for playback control operations (pause, skip, stop, shuffle).
- * Only requires the user to be in a voice channel when there is no active bot session yet.
- * If the bot is already in a channel, the user just needs to be in the same channel.
- */
+// ---- Access control ----
+
 function getPlaybackAccessError(member: GuildMember, guildId: string) {
     const botChannelId = getConnectedChannelId(guildId);
     const snapshot = getSnapshot(guildId);
@@ -707,17 +552,14 @@ function getPlaybackAccessError(member: GuildMember, guildId: string) {
 
     const userChannel = member.voice.channel;
 
-    // If there is no active session, the user must be in a voice channel to start one
     if (!hasActiveSession && !userChannel) {
         return 'Debes entrar a un canal de voz primero.';
     }
 
-    // If the bot is connected to a channel, the user must be in the same channel
     if (botChannelId && userChannel && member.voice.channelId !== botChannelId) {
-        return 'Debes estar en el mismo canal de voz que el bot para usar esa sesión.';
+        return 'Debes estar en el mismo canal de voz que el bot para usar esa sesion.';
     }
 
-    // Permission checks only apply when the user is in a voice channel
     if (userChannel) {
         const botMember = member.guild.members.me;
         if (!botMember) {
@@ -748,12 +590,14 @@ function getPlaybackAccessError(member: GuildMember, guildId: string) {
         }
 
         if (userChannel.userLimit > 0 && userChannel.members.size >= userChannel.userLimit && !userChannel.members.has(botMember.id)) {
-            return `El canal **${userChannel.name}** está lleno y el bot no puede entrar.`;
+            return `El canal **${userChannel.name}** esta lleno y el bot no puede entrar.`;
         }
     }
 
     return null;
 }
+
+// ---- Helpers ----
 
 function asTextChannel(channel: unknown): AnnouncementChannel | null {
     if (!channel || typeof channel !== 'object') {
@@ -779,7 +623,7 @@ function getPlayQueryOption(interaction: ChatInputCommandInteraction): string {
         interaction.options.getString('url', false);
 
     if (!query) {
-        throw new Error('No llegó la URL o búsqueda del comando. Si acabas de actualizar el bot, ejecuta `npm run register` y vuelve a abrir el slash command.');
+        throw new Error('No llego la URL o busqueda del comando. Si acabas de actualizar el bot, ejecuta `npm run register` y vuelve a abrir el slash command.');
     }
 
     return query;
