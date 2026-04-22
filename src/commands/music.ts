@@ -15,7 +15,6 @@ import {
 import { spawn, type ChildProcess } from 'child_process';
 import play from 'play-dl';
 import { randomUUID } from 'crypto';
-import { cleanupTtsFile, generateTtsAudio } from '../lib/tts';
 import { createControlButtons, createErrorEmbed, createNowPlayingEmbed } from '../lib/ui';
 
 const PLAYLIST_LIMIT = 25;
@@ -24,22 +23,19 @@ const DEFAULT_VOLUME = 0.8;
 const VOICE_READY_TIMEOUT_MS = 30_000;
 const VOICE_RETRY_ATTEMPTS = 3;
 
-export type TrackKind = 'music' | 'tts';
 export type AnnouncementChannel = {
     send: (payload: any) => Promise<unknown>;
 };
 
 export type QueueTrack = {
     id: string;
-    kind: TrackKind;
     title: string;
     requestedBy: string;
     requestedById: string;
     sourceLabel: string;
     durationLabel?: string;
-    url?: string;
+    url: string;
     thumbnail?: string;
-    filePath?: string;
 };
 
 export type PlaybackSnapshot = {
@@ -68,23 +64,6 @@ export type EnqueueMusicResult = {
     playlistTitle?: string;
 };
 
-export type EnqueueTtsRequest = {
-    guildId: string;
-    voiceChannelId: string;
-    adapterCreator: DiscordGatewayAdapterCreator;
-    voiceKey: string;
-    text: string;
-    requestedBy: string;
-    requestedById: string;
-    textChannel?: AnnouncementChannel | null;
-};
-
-export type EnqueueTtsResult = {
-    track: QueueTrack;
-    startedImmediately: boolean;
-    willPlayNext: boolean;
-};
-
 type GuildPlaybackState = {
     guildId: string;
     player: AudioPlayer;
@@ -100,7 +79,6 @@ type GuildPlaybackState = {
     voiceChannelId: string | null;
     adapterCreator: DiscordGatewayAdapterCreator | null;
     suppressNextIdleEvent: boolean;
-    // Serializes concurrent playback mutations per guild to prevent race conditions
     enqueueChain: Promise<void>;
 };
 
@@ -110,9 +88,7 @@ export async function enqueueMusic(request: EnqueueMusicRequest): Promise<Enqueu
     const state = getOrCreateState(request.guildId);
     state.textChannel = request.textChannel ?? state.textChannel;
 
-    // Serialize state mutations per guild so concurrent commands don't race
     return enqueueSerial(state, async () => {
-        // Resolve tracks inside the serial lock to preserve request ordering
         const resolved = await resolveMusicTracks(request.query, request.requestedBy, request.requestedById);
 
         state.voiceChannelId = request.voiceChannelId;
@@ -142,50 +118,6 @@ export async function enqueueMusic(request: EnqueueMusicRequest): Promise<Enqueu
     });
 }
 
-export async function enqueueTts(request: EnqueueTtsRequest): Promise<EnqueueTtsResult> {
-    const state = getOrCreateState(request.guildId);
-    state.textChannel = request.textChannel ?? state.textChannel;
-
-    // Serialize TTS generation and queue mutation to preserve ordering
-    return enqueueSerial(state, async () => {
-        const generated = await generateTtsAudio(request.text, request.voiceKey);
-
-        state.voiceChannelId = request.voiceChannelId;
-        state.adapterCreator = request.adapterCreator;
-
-        const preview = request.text.length > 40 ? `${request.text.slice(0, 39)}…` : request.text;
-
-        const track: QueueTrack = {
-            id: randomUUID(),
-            kind: 'tts',
-            title: `${generated.preset.label}: ${preview}`,
-            requestedBy: request.requestedBy,
-            requestedById: request.requestedById,
-            sourceLabel: generated.preset.label,
-            durationLabel: 'TTS',
-            filePath: generated.filePath,
-        };
-
-        const alreadyPlaying = hasActivePlaybackSession(state);
-        const startedImmediately = !alreadyPlaying;
-        const willPlayNext = alreadyPlaying;
-
-        if (!alreadyPlaying) {
-            await ensureConnection(state, request.voiceChannelId, request.adapterCreator);
-            state.sessionActive = true;
-        }
-
-        if (startedImmediately) {
-            state.queue.push(track);
-            await playNext(state, false);
-        } else {
-            state.queue.unshift(track);
-        }
-
-        return { track, startedImmediately, willPlayNext };
-    });
-}
-
 export function getSnapshot(guildId: string): PlaybackSnapshot | null {
     const state = guildStates.get(guildId);
     if (!state) {
@@ -209,30 +141,31 @@ export function getConnectedChannelId(guildId: string): string | null {
     return guildStates.get(guildId)?.connection?.joinConfig.channelId ?? null;
 }
 
+/**
+ * Toggles pause/resume. Used by the panel button.
+ */
 export async function togglePause(guildId: string): Promise<'paused' | 'resumed' | 'noop'> {
     const state = guildStates.get(guildId);
     if (!state) {
         return 'noop';
     }
 
-    if (!state.current && state.player.state.status === AudioPlayerStatus.Idle) {
-        return 'noop';
+    const status = state.player.state.status;
+
+    if (status === AudioPlayerStatus.Paused || status === AudioPlayerStatus.AutoPaused) {
+        return state.player.unpause() ? 'resumed' : 'noop';
     }
 
-    const status = state.player.state.status;
-        console.log(`[${guildId}] togglePause - status=${status} current=${state.current?.title ?? 'null'} queue=${state.queue.length} sessionActive=${state.sessionActive}`);
+    if (status === AudioPlayerStatus.Playing || status === AudioPlayerStatus.Buffering) {
+        return state.player.pause(true) ? 'paused' : 'noop';
+    }
 
-        if (status === AudioPlayerStatus.Paused || status === AudioPlayerStatus.AutoPaused) {
-            const resumed = state.player.unpause();
-            console.log(`[${guildId}] togglePause -> resumed=${resumed}`);
-            return resumed ? 'resumed' : 'noop';
-        }
-
-    const paused = state.player.pause(true);
-    console.log(`[${guildId}] togglePause -> paused=${paused}`);
-    return paused ? 'paused' : 'noop';
+    return 'noop';
 }
 
+/**
+ * Pauses playback. Returns true if the player is now paused (including already-paused states).
+ */
 export async function pause(guildId: string): Promise<boolean> {
     const state = guildStates.get(guildId);
     if (!state) {
@@ -240,16 +173,22 @@ export async function pause(guildId: string): Promise<boolean> {
     }
 
     const status = state.player.state.status;
-    console.log(`[${guildId}] pause() called - status=${status} current=${state.current?.title ?? 'null'} queue=${state.queue.length}`);
+
+    // Already paused — treat as success so the user gets a clear confirmation.
+    if (status === AudioPlayerStatus.Paused || status === AudioPlayerStatus.AutoPaused) {
+        return true;
+    }
+
     if (status === AudioPlayerStatus.Playing || status === AudioPlayerStatus.Buffering) {
-        const result = state.player.pause(true);
-        console.log(`[${guildId}] pause -> ${result}`);
-        return result;
+        return state.player.pause(true);
     }
 
     return false;
 }
 
+/**
+ * Resumes playback. Returns true if unpause succeeded.
+ */
 export async function resume(guildId: string): Promise<boolean> {
     const state = guildStates.get(guildId);
     if (!state) {
@@ -257,40 +196,34 @@ export async function resume(guildId: string): Promise<boolean> {
     }
 
     const status = state.player.state.status;
-    console.log(`[${guildId}] resume() called - status=${status} current=${state.current?.title ?? 'null'} queue=${state.queue.length}`);
+
     if (status === AudioPlayerStatus.Paused || status === AudioPlayerStatus.AutoPaused) {
-        const result = state.player.unpause();
-        console.log(`[${guildId}] resume -> ${result}`);
-        return result;
+        return state.player.unpause();
     }
 
     return false;
 }
 
+/**
+ * Skips the current track. All state checks happen inside the serial lock to
+ * avoid races during track transitions.
+ */
 export async function skip(guildId: string): Promise<boolean> {
     const state = guildStates.get(guildId);
     if (!state) {
         return false;
     }
 
-    // Check if there's anything to skip before acquiring the serial lock
-    const status = state.player.state.status;
-    console.log(`[${guildId}] skip() called - status=${status} current=${state.current?.title ?? 'null'} queue=${state.queue.length}`);
-    if (!state.current && status === AudioPlayerStatus.Idle) {
-        return false;
-    }
-
     return enqueueSerial(state, async () => {
-        const innerStatus = state.player.state.status;
-        console.log(`[${state.guildId}] skip (inside lock) - status=${innerStatus} current=${state.current?.title ?? 'null'} queue=${state.queue.length}`);
-        if (!state.current && innerStatus === AudioPlayerStatus.Idle) {
+        const status = state.player.state.status;
+
+        // Truly nothing to skip: player is idle and no track is loaded.
+        if (status === AudioPlayerStatus.Idle && !state.current) {
             return false;
         }
 
         destroyCurrentProcess(state);
-        const stopped = state.player.stop(true);
-        console.log(`[${state.guildId}] skip -> stopped=${stopped}`);
-        return stopped;
+        return state.player.stop(true);
     });
 }
 
@@ -301,7 +234,6 @@ export async function stop(guildId: string): Promise<boolean> {
     }
 
     return enqueueSerial(state, async () => {
-        console.log(`[${guildId}] stop() called - current=${state.current?.title ?? 'null'} queue=${state.queue.length} sessionActive=${state.sessionActive} connection=${Boolean(state.connection)}`);
         const hadSession =
             state.sessionActive ||
             Boolean(state.current) ||
@@ -310,15 +242,11 @@ export async function stop(guildId: string): Promise<boolean> {
             state.player.state.status !== AudioPlayerStatus.Idle;
 
         if (!hadSession) {
-            console.log(`[${guildId}] stop -> no active session`);
             return false;
         }
 
         clearDisconnectTimer(state);
         state.suppressNextIdleEvent = true;
-
-        const currentTrack = state.current;
-        const queuedTracks = [...state.queue];
 
         destroyCurrentProcess(state);
 
@@ -336,9 +264,6 @@ export async function stop(guildId: string): Promise<boolean> {
             state.connection = null;
         }
 
-        await cleanupTrack(currentTrack);
-        await Promise.all(queuedTracks.map((track) => cleanupTrack(track)));
-
         return true;
     });
 }
@@ -350,10 +275,9 @@ export async function clearQueue(guildId: string): Promise<number> {
     }
 
     return enqueueSerial(state, async () => {
-        const removed = [...state.queue];
+        const count = state.queue.length;
         state.queue = [];
-        await Promise.all(removed.map((track) => cleanupTrack(track)));
-        return removed.length;
+        return count;
     });
 }
 
@@ -369,23 +293,8 @@ export async function removeFromQueue(guildId: string, position: number): Promis
         }
 
         const [removed] = state.queue.splice(position - 1, 1);
-        await cleanupTrack(removed);
         return removed ?? null;
     });
-}
-
-export function shuffleQueue(guildId: string): number {
-    const state = guildStates.get(guildId);
-    if (!state || state.queue.length < 2) {
-        return state?.queue.length ?? 0;
-    }
-
-    for (let index = state.queue.length - 1; index > 0; index -= 1) {
-        const swapIndex = Math.floor(Math.random() * (index + 1));
-        [state.queue[index], state.queue[swapIndex]] = [state.queue[swapIndex], state.queue[index]];
-    }
-
-    return state.queue.length;
 }
 
 export function setVolume(guildId: string, percentage: number): number | null {
@@ -435,14 +344,13 @@ function getOrCreateState(guildId: string): GuildPlaybackState {
     });
 
     state.player.on('error', (error) => {
-        console.error(`[${guildId}] Error de reproducción:`, error);
+        console.error(`[${guildId}] Error de reproduccion:`, error);
         void enqueueSerial(state, async () => {
             const failedTrack = state.current;
             destroyCurrentProcess(state);
             state.current = null;
             state.currentResource = null;
 
-            await cleanupTrack(failedTrack);
             await announceError(state, `No pude reproducir **${failedTrack?.title ?? 'la pista actual'}**. Paso a la siguiente.`);
             await playNext(state, true);
         });
@@ -452,7 +360,7 @@ function getOrCreateState(guildId: string): GuildPlaybackState {
     return state;
 }
 
-/** Runs `fn` after the guild's current enqueue operation completes, preventing concurrent state races. */
+/** Runs fn after the guild's current enqueue operation completes, preventing concurrent state races. */
 function enqueueSerial<T>(state: GuildPlaybackState, fn: () => Promise<T>): Promise<T> {
     const result = state.enqueueChain.then(fn);
     state.enqueueChain = result.then(
@@ -518,12 +426,8 @@ async function ensureConnection(
             console.log(`[${state.guildId}] Voz intento ${attempt}: ${newState.status}`);
         });
 
-        connection.on('debug', (msg) => {
-            console.log(`[${state.guildId}] [voice debug] ${msg}`);
-        });
-
         connection.on('error', (error) => {
-            console.error(`[${state.guildId}] Error de conexión de voz:`, error);
+            console.error(`[${state.guildId}] Error de conexion de voz:`, error);
         });
 
         connection.subscribe(state.player);
@@ -552,8 +456,12 @@ async function ensureConnection(
 async function playNext(state: GuildPlaybackState, announce: boolean): Promise<void> {
     clearDisconnectTimer(state);
 
-    // Prevent starting a new resource if the player is already busy
-    if (state.player.state.status !== AudioPlayerStatus.Idle && state.currentResource) {
+    // Guard: don't start a new resource while the player is already actively playing one.
+    if (
+        (state.player.state.status === AudioPlayerStatus.Playing ||
+            state.player.state.status === AudioPlayerStatus.Buffering) &&
+        state.currentResource
+    ) {
         console.warn(`[${state.guildId}] playNext called while player busy — skipping start.`);
         return;
     }
@@ -576,7 +484,7 @@ async function playNext(state: GuildPlaybackState, announce: boolean): Promise<v
     try {
         if (!state.connection || state.connection.state.status !== VoiceConnectionStatus.Ready) {
             if (!state.voiceChannelId || !state.adapterCreator) {
-                throw new Error('No tengo contexto del canal de voz para continuar la sesión.');
+                throw new Error('No tengo contexto del canal de voz para continuar la sesion.');
             }
 
             await ensureConnection(state, state.voiceChannelId, state.adapterCreator);
@@ -594,7 +502,6 @@ async function playNext(state: GuildPlaybackState, announce: boolean): Promise<v
         }
     } catch (error) {
         console.error(`[${state.guildId}] Error creando recurso:`, error);
-        await cleanupTrack(nextTrack);
         state.current = null;
         state.currentResource = null;
         state.currentProcess = null;
@@ -609,31 +516,15 @@ async function handleTrackEnd(state: GuildPlaybackState): Promise<void> {
         return;
     }
 
-    const finishedTrack = state.current;
     state.current = null;
     state.currentResource = null;
     state.currentProcess = null;
-    await cleanupTrack(finishedTrack);
     await playNext(state, true);
 }
 
 async function createResource(track: QueueTrack): Promise<{ resource: AudioResource<QueueTrack>; process: ChildProcess | null }> {
-    if (track.kind === 'tts') {
-        if (!track.filePath) {
-            throw new Error('El archivo TTS no existe.');
-        }
-
-        return {
-            resource: createAudioResource(track.filePath, {
-                inlineVolume: true,
-                metadata: track,
-            }),
-            process: null,
-        };
-    }
-
     if (!track.url) {
-        throw new Error('La pista no tiene URL válida.');
+        throw new Error('La pista no tiene URL valida.');
     }
 
     const ytdlp = spawn('yt-dlp', [
@@ -676,12 +567,12 @@ async function resolveMusicTracks(
             .slice(0, PLAYLIST_LIMIT);
 
         if (videos.length === 0) {
-            throw new Error('No encontré videos reproducibles dentro de esa playlist.');
+            throw new Error('No encontre videos reproducibles dentro de esa playlist.');
         }
 
         return {
             tracks: videos.map((video) => createMusicTrack(video, requestedBy, requestedById)),
-            playlistTitle: playlist.title ?? 'playlist sin título',
+            playlistTitle: playlist.title ?? 'playlist sin titulo',
         };
     }
 
@@ -702,17 +593,17 @@ async function resolveMusicTracks(
             .slice(0, PLAYLIST_LIMIT);
 
         if (videos.length === 0) {
-            throw new Error('No encontré videos reproducibles dentro de esa playlist.');
+            throw new Error('No encontre videos reproducibles dentro de esa playlist.');
         }
 
         return {
             tracks: videos.map((video) => createMusicTrack(video, requestedBy, requestedById)),
-            playlistTitle: playlist.title ?? 'playlist sin título',
+            playlistTitle: playlist.title ?? 'playlist sin titulo',
         };
     }
 
     if (validation && validation !== 'yt_video' && validation !== 'search') {
-        throw new Error('Ahora mismo solo acepto YouTube o búsquedas normales para mantener el bot estable.');
+        throw new Error('Ahora mismo solo acepto YouTube o busquedas normales para mantener el bot estable.');
     }
 
     if (validation === 'yt_video') {
@@ -729,7 +620,7 @@ async function resolveMusicTracks(
 
     const match = results.find((item) => item.url && !item.live && !item.private);
     if (!match) {
-        throw new Error('No encontré resultados válidos para esa búsqueda.');
+        throw new Error('No encontre resultados validos para esa busqueda.');
     }
 
     return {
@@ -835,8 +726,7 @@ function sanitizeRawQuery(input: string): string {
 function createMusicTrack(video: any, requestedBy: string, requestedById: string): QueueTrack {
     return {
         id: randomUUID(),
-        kind: 'music',
-        title: video.title ?? 'Canción sin título',
+        title: video.title ?? 'Cancion sin titulo',
         requestedBy,
         requestedById,
         sourceLabel: 'YouTube',
@@ -892,7 +782,7 @@ function destroyCurrentProcess(state: GuildPlaybackState): void {
     try {
         activeProcess.kill();
     } catch {
-        // El proceso ya terminó o no pudo recibir la señal.
+        // El proceso ya termino o no pudo recibir la senal.
     }
 
     state.currentProcess = null;
@@ -901,14 +791,6 @@ function destroyCurrentProcess(state: GuildPlaybackState): void {
 export async function shutdownPlayback(): Promise<void> {
     const activeGuilds = [...guildStates.keys()];
     await Promise.all(activeGuilds.map((guildId) => stop(guildId)));
-}
-
-async function cleanupTrack(track: QueueTrack | null): Promise<void> {
-    if (!track || track.kind !== 'tts') {
-        return;
-    }
-
-    await cleanupTtsFile(track.filePath);
 }
 
 function snapshotFromState(state: GuildPlaybackState): PlaybackSnapshot {
